@@ -1,0 +1,2 @@
+TABLE users 2 id INT name TEXT
+INDEX users_id_idx users id
