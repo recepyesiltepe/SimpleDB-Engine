@@ -45,11 +45,15 @@ private:
     bool persistCatalog(std::string& outError) const;
     bool loadTableRows(const std::string& tableName, TableData& table, std::string& outError);
     bool appendRowToDisk(const std::string& tableName, const TableData& table, const Row& row, std::string& outError);
+    bool rewriteTableRows(const std::string& tableName, const TableData& table, std::string& outError);
+    void rebuildIndexes(TableData& table);
 
     bool executeCreateTable(const CreateTableStatement& statement, std::string& outMessage);
     bool executeInsert(const InsertStatement& statement, std::string& outMessage);
     bool executeCreateIndex(const CreateIndexStatement& statement, std::string& outMessage);
     bool executeSelect(const SelectStatement& statement, std::optional<SelectResult>& outSelectResult, std::string& outMessage);
+    bool executeUpdate(const UpdateStatement& statement, std::string& outMessage);
+    bool executeDelete(const DeleteStatement& statement, std::string& outMessage);
 
     static bool equalsIgnoreCase(const std::string& left, const std::string& right);
 };

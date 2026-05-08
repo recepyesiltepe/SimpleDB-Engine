@@ -1,0 +1,24 @@
+# Build directories
+/build/
+
+# CMake artifacts
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/compile_commands.json
+/Makefile
+
+# Binary output
+/simpledb
+
+# Object and library files
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Runtime data
+/data/

@@ -220,7 +220,7 @@ public:
             } else {
                 while (true) {
                     std::string name;
-                    if (!parseIdentifier(name, outError)) {
+                    if (!parseColumnToken(name, outError)) {
                         return false;
                     }
                     statement.columns.push_back(name);
@@ -233,6 +233,102 @@ public:
             if (!expectKeyword("FROM", outError)) {
                 return false;
             }
+            if (!parseIdentifier(statement.tableName, outError)) {
+                return false;
+            }
+            if (matchKeyword("INNER")) {
+                consume();
+                if (!expectKeyword("JOIN", outError)) {
+                    return false;
+                }
+                InnerJoinClause join;
+                if (!parseIdentifier(join.tableName, outError)) {
+                    return false;
+                }
+                if (!expectKeyword("ON", outError)) {
+                    return false;
+                }
+                if (!parseColumnToken(join.leftColumnName, outError)) {
+                    return false;
+                }
+                if (!expectSymbol("=", outError)) {
+                    return false;
+                }
+                if (!parseColumnToken(join.rightColumnName, outError)) {
+                    return false;
+                }
+                statement.join = join;
+            }
+            if (matchKeyword("WHERE")) {
+                consume();
+                WhereEquals where;
+                if (!parseColumnToken(where.columnName, outError)) {
+                    return false;
+                }
+                if (!expectSymbol("=", outError)) {
+                    return false;
+                }
+                if (!parseValue(where.value, outError)) {
+                    return false;
+                }
+                statement.where = where;
+            }
+            consumeSemicolonIfPresent();
+            if (current_.kind != TokenKind::End) {
+                outError = "Unexpected trailing tokens";
+                return false;
+            }
+            outStatement = statement;
+            return true;
+        }
+
+        if (matchKeyword("UPDATE")) {
+            consume();
+            UpdateStatement statement;
+            if (!parseIdentifier(statement.tableName, outError)) {
+                return false;
+            }
+            if (!expectKeyword("SET", outError)) {
+                return false;
+            }
+            if (!parseIdentifier(statement.columnName, outError)) {
+                return false;
+            }
+            if (!expectSymbol("=", outError)) {
+                return false;
+            }
+            if (!parseValue(statement.value, outError)) {
+                return false;
+            }
+            if (matchKeyword("WHERE")) {
+                consume();
+                WhereEquals where;
+                if (!parseIdentifier(where.columnName, outError)) {
+                    return false;
+                }
+                if (!expectSymbol("=", outError)) {
+                    return false;
+                }
+                if (!parseValue(where.value, outError)) {
+                    return false;
+                }
+                statement.where = where;
+            }
+            consumeSemicolonIfPresent();
+            if (current_.kind != TokenKind::End) {
+                outError = "Unexpected trailing tokens";
+                return false;
+            }
+            outStatement = statement;
+            return true;
+        }
+
+        if (matchKeyword("DELETE")) {
+            consume();
+            if (!expectKeyword("FROM", outError)) {
+                return false;
+            }
+            DeleteStatement statement;
             if (!parseIdentifier(statement.tableName, outError)) {
                 return false;
             }
@@ -301,6 +397,24 @@ private:
         }
         outIdentifier = current_.text;
         consume();
+        return true;
+    }
+
+    bool parseColumnToken(std::string& outColumn, std::string& outError) {
+        std::string left;
+        if (!parseIdentifier(left, outError)) {
+            return false;
+        }
+        if (matchSymbol(".")) {
+            consume();
+            std::string right;
+            if (!parseIdentifier(right, outError)) {
+                return false;
+            }
+            outColumn = left + "." + right;
+            return true;
+        }
+        outColumn = left;
         return true;
     }
 

@@ -30,14 +30,33 @@ struct WhereEquals {
     Value value;
 };
 
+struct UpdateStatement {
+    std::string tableName;
+    std::string columnName;
+    Value value;
+    std::optional<WhereEquals> where;
+};
+
+struct DeleteStatement {
+    std::string tableName;
+    std::optional<WhereEquals> where;
+};
+
+struct InnerJoinClause {
+    std::string tableName;
+    std::string leftColumnName;
+    std::string rightColumnName;
+};
+
 struct SelectStatement {
     std::string tableName;
     std::vector<std::string> columns;
     bool selectAll = false;
+    std::optional<InnerJoinClause> join;
     std::optional<WhereEquals> where;
 };
 
-using Statement = std::variant<CreateTableStatement, InsertStatement, CreateIndexStatement, SelectStatement>;
+using Statement = std::variant<CreateTableStatement, InsertStatement, CreateIndexStatement, SelectStatement, UpdateStatement, DeleteStatement>;
 
 bool tryParseStatement(const std::string& sql, Statement& outStatement, std::string& outError);
 
