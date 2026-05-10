@@ -60,6 +60,27 @@ bool equalsValue(const Value& left, const Value& right) {
     return std::get<std::string>(left) == std::get<std::string>(right);
 }
 
+int compareValues(const Value& left, const Value& right) {
+    if (left.index() != right.index()) {
+        return left.index() < right.index() ? -1 : 1;
+    }
+    if (std::holds_alternative<int64_t>(left)) {
+        int64_t leftValue = std::get<int64_t>(left);
+        int64_t rightValue = std::get<int64_t>(right);
+        if (leftValue == rightValue) {
+            return 0;
+        }
+        return leftValue < rightValue ? -1 : 1;
+    }
+
+    const std::string& leftValue = std::get<std::string>(left);
+    const std::string& rightValue = std::get<std::string>(right);
+    if (leftValue == rightValue) {
+        return 0;
+    }
+    return leftValue < rightValue ? -1 : 1;
+}
+
 bool parseQualifiedColumn(const std::string& text, std::string& outTable, std::string& outColumn) {
     std::size_t dot = text.find('.');
     if (dot == std::string::npos) {
@@ -533,6 +554,18 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         return false;
     }
     const auto& leftTable = tableIt->second;
+    if (statement.countAll && statement.selectAll) {
+        outMessage = "COUNT(*) cannot be combined with *";
+        return false;
+    }
+    if (statement.countAll && !statement.columns.empty()) {
+        outMessage = "COUNT(*) cannot be combined with explicit columns";
+        return false;
+    }
+    if (statement.countAll && (statement.orderBy.has_value() || statement.limit.has_value())) {
+        outMessage = "ORDER BY/LIMIT with COUNT(*) is not supported in this version";
+        return false;
+    }
 
     if (statement.join.has_value()) {
         const auto& join = statement.join.value();
@@ -601,14 +634,14 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
             std::string outputName;
         };
         std::vector<ProjectionColumn> projection;
-        if (statement.selectAll) {
+        if (!statement.countAll && statement.selectAll) {
             for (std::size_t i = 0; i < leftTable.columns.size(); ++i) {
                 projection.push_back({true, i, statement.tableName + "." + leftTable.columns[i].name});
             }
             for (std::size_t i = 0; i < rightTable.columns.size(); ++i) {
                 projection.push_back({false, i, join.tableName + "." + rightTable.columns[i].name});
             }
-        } else {
+        } else if (!statement.countAll) {
             for (const auto& token : statement.columns) {
                 std::string qualifier;
                 std::string column;
@@ -662,11 +695,10 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
             std::size_t index = 0;
             Value value;
         };
-        std::optional<WhereBinding> whereBinding;
-        if (statement.where.has_value()) {
+        std::vector<WhereBinding> whereBindings;
+        for (const auto& where : statement.whereClauses) {
             std::string qualifier;
             std::string column;
-            const auto& where = statement.where.value();
             if (!parseQualifiedColumn(where.columnName, qualifier, column)) {
                 outMessage = "Invalid WHERE column: " + where.columnName;
                 return false;
@@ -690,13 +722,13 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
                         outMessage = "WHERE value type mismatch";
                         return false;
                     }
-                    whereBinding = WhereBinding{true, idx, where.value};
+                    whereBindings.push_back(WhereBinding{true, idx, where.value});
                 } else if (equalsIgnoreCase(qualifier, join.tableName) && resolveWhere(rightTable, column, idx)) {
                     if (!isTypeCompatible(where.value, rightTable.columns[idx].type)) {
                         outMessage = "WHERE value type mismatch";
                         return false;
                     }
-                    whereBinding = WhereBinding{false, idx, where.value};
+                    whereBindings.push_back(WhereBinding{false, idx, where.value});
                 } else {
                     outMessage = "Unknown WHERE column: " + where.columnName;
                     return false;
@@ -708,13 +740,13 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
                         outMessage = "WHERE value type mismatch";
                         return false;
                     }
-                    whereBinding = WhereBinding{true, idx, where.value};
+                    whereBindings.push_back(WhereBinding{true, idx, where.value});
                 } else if (resolveWhere(rightTable, column, idx)) {
                     if (!isTypeCompatible(where.value, rightTable.columns[idx].type)) {
                         outMessage = "WHERE value type mismatch";
                         return false;
                     }
-                    whereBinding = WhereBinding{false, idx, where.value};
+                    whereBindings.push_back(WhereBinding{false, idx, where.value});
                 } else {
                     outMessage = "Unknown WHERE column: " + where.columnName;
                     return false;
@@ -722,28 +754,107 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
             }
         }
 
-        SelectResult result;
-        for (const auto& p : projection) {
-            result.columnNames.push_back(p.outputName);
-        }
-
-        for (const auto& leftRow : leftTable.rows) {
-            for (const auto& rightRow : rightTable.rows) {
+        std::vector<std::pair<std::size_t, std::size_t>> matchedPairs;
+        for (std::size_t leftRowId = 0; leftRowId < leftTable.rows.size(); ++leftRowId) {
+            const auto& leftRow = leftTable.rows[leftRowId];
+            for (std::size_t rightRowId = 0; rightRowId < rightTable.rows.size(); ++rightRowId) {
+                const auto& rightRow = rightTable.rows[rightRowId];
                 if (!equalsValue(leftRow[leftJoinIndex], rightRow[rightJoinIndex])) {
                     continue;
                 }
-                if (whereBinding.has_value()) {
-                    const auto& binding = whereBinding.value();
+                bool matchesAll = true;
+                for (const auto& binding : whereBindings) {
                     const Value& current = binding.fromLeft ? leftRow[binding.index] : rightRow[binding.index];
                     if (!equalsValue(current, binding.value)) {
-                        continue;
+                        matchesAll = false;
+                        break;
                     }
                 }
+                if (!matchesAll) {
+                    continue;
+                }
+                matchedPairs.push_back({leftRowId, rightRowId});
+            }
+        }
 
+        if (statement.orderBy.has_value()) {
+            const auto& orderBy = statement.orderBy.value();
+            std::string qualifier;
+            std::string column;
+            if (!parseQualifiedColumn(orderBy.columnName, qualifier, column)) {
+                outMessage = "Invalid ORDER BY column: " + orderBy.columnName;
+                return false;
+            }
+
+            bool fromLeft = true;
+            std::size_t orderIndex = 0;
+            auto resolveOrder = [&](const TableData& table, const std::string& colName, std::size_t& idx) -> bool {
+                auto it = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& c) {
+                    return equalsIgnoreCase(c.name, colName);
+                });
+                if (it == table.columns.end()) {
+                    return false;
+                }
+                idx = static_cast<std::size_t>(it - table.columns.begin());
+                return true;
+            };
+
+            if (!qualifier.empty()) {
+                if (equalsIgnoreCase(qualifier, statement.tableName) && resolveOrder(leftTable, column, orderIndex)) {
+                    fromLeft = true;
+                } else if (equalsIgnoreCase(qualifier, join.tableName) && resolveOrder(rightTable, column, orderIndex)) {
+                    fromLeft = false;
+                } else {
+                    outMessage = "Unknown ORDER BY column: " + orderBy.columnName;
+                    return false;
+                }
+            } else {
+                if (resolveOrder(leftTable, column, orderIndex)) {
+                    fromLeft = true;
+                } else if (resolveOrder(rightTable, column, orderIndex)) {
+                    fromLeft = false;
+                } else {
+                    outMessage = "Unknown ORDER BY column: " + orderBy.columnName;
+                    return false;
+                }
+            }
+
+            std::sort(matchedPairs.begin(), matchedPairs.end(), [&](const auto& leftPair, const auto& rightPair) {
+                const Value& leftValue = fromLeft
+                                             ? leftTable.rows[leftPair.first][orderIndex]
+                                             : rightTable.rows[leftPair.second][orderIndex];
+                const Value& rightValue = fromLeft
+                                              ? leftTable.rows[rightPair.first][orderIndex]
+                                              : rightTable.rows[rightPair.second][orderIndex];
+                int cmp = compareValues(leftValue, rightValue);
+                if (cmp == 0) {
+                    return leftPair < rightPair;
+                }
+                return orderBy.ascending ? (cmp < 0) : (cmp > 0);
+            });
+        }
+
+        if (statement.limit.has_value() && matchedPairs.size() > statement.limit.value()) {
+            matchedPairs.resize(statement.limit.value());
+        }
+
+        SelectResult result;
+        if (statement.countAll) {
+            result.columnNames.push_back("count");
+            Row countRow;
+            countRow.push_back(static_cast<int64_t>(matchedPairs.size()));
+            result.rows.push_back(std::move(countRow));
+        } else {
+            for (const auto& p : projection) {
+                result.columnNames.push_back(p.outputName);
+            }
+            for (const auto& pair : matchedPairs) {
                 Row outRow;
                 outRow.reserve(projection.size());
                 for (const auto& p : projection) {
-                    outRow.push_back(p.fromLeft ? leftRow[p.index] : rightRow[p.index]);
+                    outRow.push_back(p.fromLeft
+                                         ? leftTable.rows[pair.first][p.index]
+                                         : rightTable.rows[pair.second][p.index]);
                 }
                 result.rows.push_back(std::move(outRow));
             }
@@ -757,17 +868,27 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
     const auto& table = leftTable;
 
     std::vector<std::size_t> selectedColumnIndexes;
-    if (statement.selectAll) {
+    if (!statement.countAll && statement.selectAll) {
         for (std::size_t i = 0; i < table.columns.size(); ++i) {
             selectedColumnIndexes.push_back(i);
         }
-    } else {
-        for (const auto& name : statement.columns) {
+    } else if (!statement.countAll) {
+        for (const auto& token : statement.columns) {
+            std::string qualifier;
+            std::string name;
+            if (!parseQualifiedColumn(token, qualifier, name)) {
+                outMessage = "Invalid selected column: " + token;
+                return false;
+            }
+            if (!qualifier.empty() && !equalsIgnoreCase(qualifier, statement.tableName)) {
+                outMessage = "Unknown selected column: " + token;
+                return false;
+            }
             auto colIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
                 return equalsIgnoreCase(col.name, name);
             });
             if (colIt == table.columns.end()) {
-                outMessage = "Unknown selected column: " + name;
+                outMessage = "Unknown selected column: " + token;
                 return false;
             }
             selectedColumnIndexes.push_back(static_cast<std::size_t>(colIt - table.columns.begin()));
@@ -780,10 +901,19 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         candidateRows.push_back(rowId);
     }
 
-    if (statement.where.has_value()) {
-        const auto& where = statement.where.value();
+    for (const auto& where : statement.whereClauses) {
+        std::string qualifier;
+        std::string whereName;
+        if (!parseQualifiedColumn(where.columnName, qualifier, whereName)) {
+            outMessage = "Invalid WHERE column: " + where.columnName;
+            return false;
+        }
+        if (!qualifier.empty() && !equalsIgnoreCase(qualifier, statement.tableName)) {
+            outMessage = "Unknown WHERE column: " + where.columnName;
+            return false;
+        }
         auto whereColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
-            return equalsIgnoreCase(col.name, where.columnName);
+            return equalsIgnoreCase(col.name, whereName);
         });
         if (whereColIt == table.columns.end()) {
             outMessage = "Unknown WHERE column: " + where.columnName;
@@ -796,7 +926,7 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         }
 
         bool usedIndex = false;
-        if (whereColIt->type == ColumnType::Int64) {
+        if (whereColIt->type == ColumnType::Int64 && candidateRows.size() == table.rows.size()) {
             for (const auto& index : table.indexes) {
                 if (index.columnIndex == whereIndex) {
                     candidateRows = index.tree.searchEqual(std::get<int64_t>(where.value));
@@ -818,17 +948,59 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         }
     }
 
-    SelectResult result;
-    for (std::size_t idx : selectedColumnIndexes) {
-        result.columnNames.push_back(table.columns[idx].name);
-    }
-    for (std::size_t rowId : candidateRows) {
-        Row outRow;
-        outRow.reserve(selectedColumnIndexes.size());
-        for (std::size_t idx : selectedColumnIndexes) {
-            outRow.push_back(table.rows[rowId][idx]);
+    if (statement.orderBy.has_value()) {
+        const auto& orderBy = statement.orderBy.value();
+        std::string qualifier;
+        std::string orderName;
+        if (!parseQualifiedColumn(orderBy.columnName, qualifier, orderName)) {
+            outMessage = "Invalid ORDER BY column: " + orderBy.columnName;
+            return false;
         }
-        result.rows.push_back(std::move(outRow));
+        if (!qualifier.empty() && !equalsIgnoreCase(qualifier, statement.tableName)) {
+            outMessage = "Unknown ORDER BY column: " + orderBy.columnName;
+            return false;
+        }
+        auto orderColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
+            return equalsIgnoreCase(col.name, orderName);
+        });
+        if (orderColIt == table.columns.end()) {
+            outMessage = "Unknown ORDER BY column: " + orderBy.columnName;
+            return false;
+        }
+        std::size_t orderIndex = static_cast<std::size_t>(orderColIt - table.columns.begin());
+        std::sort(candidateRows.begin(), candidateRows.end(), [&](std::size_t leftRowId, std::size_t rightRowId) {
+            const Value& leftValue = table.rows[leftRowId][orderIndex];
+            const Value& rightValue = table.rows[rightRowId][orderIndex];
+            int cmp = compareValues(leftValue, rightValue);
+            if (cmp == 0) {
+                return leftRowId < rightRowId;
+            }
+            return orderBy.ascending ? (cmp < 0) : (cmp > 0);
+        });
+    }
+
+    if (statement.limit.has_value() && candidateRows.size() > statement.limit.value()) {
+        candidateRows.resize(statement.limit.value());
+    }
+
+    SelectResult result;
+    if (statement.countAll) {
+        result.columnNames.push_back("count");
+        Row countRow;
+        countRow.push_back(static_cast<int64_t>(candidateRows.size()));
+        result.rows.push_back(std::move(countRow));
+    } else {
+        for (std::size_t idx : selectedColumnIndexes) {
+            result.columnNames.push_back(table.columns[idx].name);
+        }
+        for (std::size_t rowId : candidateRows) {
+            Row outRow;
+            outRow.reserve(selectedColumnIndexes.size());
+            for (std::size_t idx : selectedColumnIndexes) {
+                outRow.push_back(table.rows[rowId][idx]);
+            }
+            result.rows.push_back(std::move(outRow));
+        }
     }
 
     outSelectResult = result;

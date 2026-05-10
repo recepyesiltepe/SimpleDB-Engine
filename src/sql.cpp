@@ -217,6 +217,18 @@ public:
             if (matchSymbol("*")) {
                 statement.selectAll = true;
                 consume();
+            } else if (matchKeyword("COUNT")) {
+                consume();
+                if (!expectSymbol("(", outError)) {
+                    return false;
+                }
+                if (!expectSymbol("*", outError)) {
+                    return false;
+                }
+                if (!expectSymbol(")", outError)) {
+                    return false;
+                }
+                statement.countAll = true;
             } else {
                 while (true) {
                     std::string name;
@@ -261,17 +273,56 @@ public:
             }
             if (matchKeyword("WHERE")) {
                 consume();
-                WhereEquals where;
-                if (!parseColumnToken(where.columnName, outError)) {
+                while (true) {
+                    WhereEquals where;
+                    if (!parseColumnToken(where.columnName, outError)) {
+                        return false;
+                    }
+                    if (!expectSymbol("=", outError)) {
+                        return false;
+                    }
+                    if (!parseValue(where.value, outError)) {
+                        return false;
+                    }
+                    statement.whereClauses.push_back(where);
+                    if (!matchKeyword("AND")) {
+                        break;
+                    }
+                    consume();
+                }
+            }
+            if (matchKeyword("ORDER")) {
+                consume();
+                if (!expectKeyword("BY", outError)) {
                     return false;
                 }
-                if (!expectSymbol("=", outError)) {
+                OrderByClause orderBy;
+                if (!parseColumnToken(orderBy.columnName, outError)) {
                     return false;
                 }
-                if (!parseValue(where.value, outError)) {
+                if (matchKeyword("ASC")) {
+                    consume();
+                } else if (matchKeyword("DESC")) {
+                    orderBy.ascending = false;
+                    consume();
+                }
+                statement.orderBy = orderBy;
+            }
+            if (matchKeyword("LIMIT")) {
+                consume();
+                if (current_.kind != TokenKind::Number) {
+                    outError = "Expected LIMIT number";
                     return false;
                 }
-                statement.where = where;
+                std::istringstream in(current_.text);
+                int64_t parsed = -1;
+                in >> parsed;
+                if (in.fail() || parsed < 0) {
+                    outError = "Invalid LIMIT value: " + current_.text;
+                    return false;
+                }
+                statement.limit = static_cast<std::size_t>(parsed);
+                consume();
             }
             consumeSemicolonIfPresent();
             if (current_.kind != TokenKind::End) {

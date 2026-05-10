@@ -2,6 +2,7 @@
 
 #include "types.h"
 
+#include <cstddef>
 #include <optional>
 #include <string>
 #include <variant>
@@ -48,12 +49,20 @@ struct InnerJoinClause {
     std::string rightColumnName;
 };
 
+struct OrderByClause {
+    std::string columnName;
+    bool ascending = true;
+};
+
 struct SelectStatement {
     std::string tableName;
     std::vector<std::string> columns;
     bool selectAll = false;
+    bool countAll = false;
     std::optional<InnerJoinClause> join;
-    std::optional<WhereEquals> where;
+    std::vector<WhereEquals> whereClauses;
+    std::optional<OrderByClause> orderBy;
+    std::optional<std::size_t> limit;
 };
 
 using Statement = std::variant<CreateTableStatement, InsertStatement, CreateIndexStatement, SelectStatement, UpdateStatement, DeleteStatement>;
