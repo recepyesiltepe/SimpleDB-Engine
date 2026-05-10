@@ -112,4 +112,53 @@ std::vector<std::size_t> BPlusTree::searchEqual(int64_t key) const {
     return node->rowIds[pos];
 }
 
+std::vector<std::size_t> BPlusTree::searchRange(std::optional<int64_t> minKey, bool includeMin,
+                                                std::optional<int64_t> maxKey, bool includeMax) const {
+    std::vector<std::size_t> result;
+    std::shared_ptr<Node> node = root_;
+
+    if (minKey.has_value()) {
+        while (!node->leaf) {
+            std::size_t childIndex = findChildIndex(node->keys, minKey.value());
+            node = node->children[childIndex];
+        }
+    } else {
+        while (!node->leaf) {
+            node = node->children.front();
+        }
+    }
+
+    while (node) {
+        for (std::size_t i = 0; i < node->keys.size(); ++i) {
+            int64_t key = node->keys[i];
+
+            if (minKey.has_value()) {
+                if (includeMin) {
+                    if (key < minKey.value()) {
+                        continue;
+                    }
+                } else if (key <= minKey.value()) {
+                    continue;
+                }
+            }
+
+            if (maxKey.has_value()) {
+                if (includeMax) {
+                    if (key > maxKey.value()) {
+                        return result;
+                    }
+                } else if (key >= maxKey.value()) {
+                    return result;
+                }
+            }
+
+            const auto& ids = node->rowIds[i];
+            result.insert(result.end(), ids.begin(), ids.end());
+        }
+        node = node->nextLeaf;
+    }
+
+    return result;
+}
+
 }  // namespace simpledb

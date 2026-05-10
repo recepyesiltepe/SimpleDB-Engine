@@ -946,14 +946,44 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         }
 
         bool usedIndex = false;
-        if (where.op == ComparisonOperator::Equal &&
-            whereColIt->type == ColumnType::Int64 &&
-            candidateRows.size() == table.rows.size()) {
+        if (whereColIt->type == ColumnType::Int64 && candidateRows.size() == table.rows.size()) {
+            const auto* matchingIndex = static_cast<const IndexInfo*>(nullptr);
             for (const auto& index : table.indexes) {
                 if (index.columnIndex == whereIndex) {
-                    candidateRows = index.tree.searchEqual(std::get<int64_t>(where.value));
-                    usedIndex = true;
+                    matchingIndex = &index;
                     break;
+                }
+            }
+            if (matchingIndex != nullptr) {
+                int64_t needle = std::get<int64_t>(where.value);
+                switch (where.op) {
+                    case ComparisonOperator::Equal:
+                        candidateRows = matchingIndex->tree.searchEqual(needle);
+                        usedIndex = true;
+                        break;
+                    case ComparisonOperator::Less:
+                        candidateRows = matchingIndex->tree.searchRange(std::nullopt, false, needle, false);
+                        usedIndex = true;
+                        break;
+                    case ComparisonOperator::LessEqual:
+                        candidateRows = matchingIndex->tree.searchRange(std::nullopt, false, needle, true);
+                        usedIndex = true;
+                        break;
+                    case ComparisonOperator::Greater:
+                        candidateRows = matchingIndex->tree.searchRange(needle, false, std::nullopt, false);
+                        usedIndex = true;
+                        break;
+                    case ComparisonOperator::GreaterEqual:
+                        candidateRows = matchingIndex->tree.searchRange(needle, true, std::nullopt, false);
+                        usedIndex = true;
+                        break;
+                    case ComparisonOperator::NotEqual: {
+                        candidateRows = matchingIndex->tree.searchRange(std::nullopt, false, needle, false);
+                        std::vector<std::size_t> tail = matchingIndex->tree.searchRange(needle, false, std::nullopt, false);
+                        candidateRows.insert(candidateRows.end(), tail.begin(), tail.end());
+                        usedIndex = true;
+                        break;
+                    }
                 }
             }
         }

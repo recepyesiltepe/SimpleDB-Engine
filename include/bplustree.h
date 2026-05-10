@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace simpledb {
@@ -13,6 +14,8 @@ public:
 
     void insert(int64_t key, std::size_t rowId);
     std::vector<std::size_t> searchEqual(int64_t key) const;
+    std::vector<std::size_t> searchRange(std::optional<int64_t> minKey, bool includeMin,
+                                         std::optional<int64_t> maxKey, bool includeMax) const;
     void clear();
 
 private:

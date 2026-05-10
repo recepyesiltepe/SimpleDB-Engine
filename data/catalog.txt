@@ -1,2 +1,2 @@
-TABLE orders 3 id INT user_id INT item TEXT
-TABLE users 3 id INT name TEXT age INT
+TABLE users 3 id INT age INT name TEXT
+INDEX users_age_idx users age
