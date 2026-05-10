@@ -274,11 +274,11 @@ public:
             if (matchKeyword("WHERE")) {
                 consume();
                 while (true) {
-                    WhereEquals where;
+                    WhereClause where;
                     if (!parseColumnToken(where.columnName, outError)) {
                         return false;
                     }
-                    if (!expectSymbol("=", outError)) {
+                    if (!parseComparisonOperator(where.op, outError)) {
                         return false;
                     }
                     if (!parseValue(where.value, outError)) {
@@ -353,11 +353,11 @@ public:
             }
             if (matchKeyword("WHERE")) {
                 consume();
-                WhereEquals where;
+                WhereClause where;
                 if (!parseIdentifier(where.columnName, outError)) {
                     return false;
                 }
-                if (!expectSymbol("=", outError)) {
+                if (!parseComparisonOperator(where.op, outError)) {
                     return false;
                 }
                 if (!parseValue(where.value, outError)) {
@@ -385,11 +385,11 @@ public:
             }
             if (matchKeyword("WHERE")) {
                 consume();
-                WhereEquals where;
+                WhereClause where;
                 if (!parseIdentifier(where.columnName, outError)) {
                     return false;
                 }
-                if (!expectSymbol("=", outError)) {
+                if (!parseComparisonOperator(where.op, outError)) {
                     return false;
                 }
                 if (!parseValue(where.value, outError)) {
@@ -488,6 +488,46 @@ private:
             return true;
         }
         outError = "Expected value";
+        return false;
+    }
+
+    bool parseComparisonOperator(ComparisonOperator& outOperator, std::string& outError) {
+        if (matchSymbol("=")) {
+            outOperator = ComparisonOperator::Equal;
+            consume();
+            return true;
+        }
+        if (matchSymbol("!")) {
+            consume();
+            if (!matchSymbol("=")) {
+                outError = "Expected = after !";
+                return false;
+            }
+            consume();
+            outOperator = ComparisonOperator::NotEqual;
+            return true;
+        }
+        if (matchSymbol("<")) {
+            consume();
+            if (matchSymbol("=")) {
+                consume();
+                outOperator = ComparisonOperator::LessEqual;
+            } else {
+                outOperator = ComparisonOperator::Less;
+            }
+            return true;
+        }
+        if (matchSymbol(">")) {
+            consume();
+            if (matchSymbol("=")) {
+                consume();
+                outOperator = ComparisonOperator::GreaterEqual;
+            } else {
+                outOperator = ComparisonOperator::Greater;
+            }
+            return true;
+        }
+        outError = "Expected comparison operator";
         return false;
     }
 

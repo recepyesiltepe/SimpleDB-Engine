@@ -81,6 +81,25 @@ int compareValues(const Value& left, const Value& right) {
     return leftValue < rightValue ? -1 : 1;
 }
 
+bool evaluateComparison(const Value& left, ComparisonOperator op, const Value& right) {
+    int cmp = compareValues(left, right);
+    switch (op) {
+        case ComparisonOperator::Equal:
+            return cmp == 0;
+        case ComparisonOperator::NotEqual:
+            return cmp != 0;
+        case ComparisonOperator::Less:
+            return cmp < 0;
+        case ComparisonOperator::LessEqual:
+            return cmp <= 0;
+        case ComparisonOperator::Greater:
+            return cmp > 0;
+        case ComparisonOperator::GreaterEqual:
+            return cmp >= 0;
+    }
+    return false;
+}
+
 bool parseQualifiedColumn(const std::string& text, std::string& outTable, std::string& outColumn) {
     std::size_t dot = text.find('.');
     if (dot == std::string::npos) {
@@ -693,6 +712,7 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         struct WhereBinding {
             bool fromLeft = true;
             std::size_t index = 0;
+            ComparisonOperator op = ComparisonOperator::Equal;
             Value value;
         };
         std::vector<WhereBinding> whereBindings;
@@ -722,13 +742,13 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
                         outMessage = "WHERE value type mismatch";
                         return false;
                     }
-                    whereBindings.push_back(WhereBinding{true, idx, where.value});
+                    whereBindings.push_back(WhereBinding{true, idx, where.op, where.value});
                 } else if (equalsIgnoreCase(qualifier, join.tableName) && resolveWhere(rightTable, column, idx)) {
                     if (!isTypeCompatible(where.value, rightTable.columns[idx].type)) {
                         outMessage = "WHERE value type mismatch";
                         return false;
                     }
-                    whereBindings.push_back(WhereBinding{false, idx, where.value});
+                    whereBindings.push_back(WhereBinding{false, idx, where.op, where.value});
                 } else {
                     outMessage = "Unknown WHERE column: " + where.columnName;
                     return false;
@@ -740,13 +760,13 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
                         outMessage = "WHERE value type mismatch";
                         return false;
                     }
-                    whereBindings.push_back(WhereBinding{true, idx, where.value});
+                    whereBindings.push_back(WhereBinding{true, idx, where.op, where.value});
                 } else if (resolveWhere(rightTable, column, idx)) {
                     if (!isTypeCompatible(where.value, rightTable.columns[idx].type)) {
                         outMessage = "WHERE value type mismatch";
                         return false;
                     }
-                    whereBindings.push_back(WhereBinding{false, idx, where.value});
+                    whereBindings.push_back(WhereBinding{false, idx, where.op, where.value});
                 } else {
                     outMessage = "Unknown WHERE column: " + where.columnName;
                     return false;
@@ -765,7 +785,7 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
                 bool matchesAll = true;
                 for (const auto& binding : whereBindings) {
                     const Value& current = binding.fromLeft ? leftRow[binding.index] : rightRow[binding.index];
-                    if (!equalsValue(current, binding.value)) {
+                    if (!evaluateComparison(current, binding.op, binding.value)) {
                         matchesAll = false;
                         break;
                     }
@@ -926,7 +946,9 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         }
 
         bool usedIndex = false;
-        if (whereColIt->type == ColumnType::Int64 && candidateRows.size() == table.rows.size()) {
+        if (where.op == ComparisonOperator::Equal &&
+            whereColIt->type == ColumnType::Int64 &&
+            candidateRows.size() == table.rows.size()) {
             for (const auto& index : table.indexes) {
                 if (index.columnIndex == whereIndex) {
                     candidateRows = index.tree.searchEqual(std::get<int64_t>(where.value));
@@ -940,7 +962,7 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
             std::vector<std::size_t> filtered;
             filtered.reserve(candidateRows.size());
             for (std::size_t rowId : candidateRows) {
-                if (equalsValue(table.rows[rowId][whereIndex], where.value)) {
+                if (evaluateComparison(table.rows[rowId][whereIndex], where.op, where.value)) {
                     filtered.push_back(rowId);
                 }
             }
@@ -1050,7 +1072,10 @@ bool Database::executeUpdate(const UpdateStatement& statement, std::string& outM
     for (auto& row : table.rows) {
         bool matches = true;
         if (whereIndex.has_value()) {
-            matches = equalsValue(row[whereIndex.value()], statement.where.value().value);
+            matches = evaluateComparison(
+                row[whereIndex.value()],
+                statement.where.value().op,
+                statement.where.value().value);
         }
         if (!matches) {
             continue;
@@ -1100,7 +1125,10 @@ bool Database::executeDelete(const DeleteStatement& statement, std::string& outM
     for (const auto& row : table.rows) {
         bool matches = true;
         if (whereIndex.has_value()) {
-            matches = equalsValue(row[whereIndex.value()], statement.where.value().value);
+            matches = evaluateComparison(
+                row[whereIndex.value()],
+                statement.where.value().op,
+                statement.where.value().value);
         }
         if (matches) {
             ++deleted;

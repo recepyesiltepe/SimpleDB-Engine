@@ -26,8 +26,18 @@ struct CreateIndexStatement {
     std::string columnName;
 };
 
-struct WhereEquals {
+enum class ComparisonOperator {
+    Equal,
+    NotEqual,
+    Less,
+    LessEqual,
+    Greater,
+    GreaterEqual,
+};
+
+struct WhereClause {
     std::string columnName;
+    ComparisonOperator op = ComparisonOperator::Equal;
     Value value;
 };
 
@@ -35,12 +45,12 @@ struct UpdateStatement {
     std::string tableName;
     std::string columnName;
     Value value;
-    std::optional<WhereEquals> where;
+    std::optional<WhereClause> where;
 };
 
 struct DeleteStatement {
     std::string tableName;
-    std::optional<WhereEquals> where;
+    std::optional<WhereClause> where;
 };
 
 struct InnerJoinClause {
@@ -60,7 +70,7 @@ struct SelectStatement {
     bool selectAll = false;
     bool countAll = false;
     std::optional<InnerJoinClause> join;
-    std::vector<WhereEquals> whereClauses;
+    std::vector<WhereClause> whereClauses;
     std::optional<OrderByClause> orderBy;
     std::optional<std::size_t> limit;
 };
