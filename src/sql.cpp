@@ -182,6 +182,23 @@ public:
             if (!parseIdentifier(statement.tableName, outError)) {
                 return false;
             }
+            if (matchSymbol("(")) {
+                consume();
+                while (true) {
+                    std::string columnName;
+                    if (!parseIdentifier(columnName, outError)) {
+                        return false;
+                    }
+                    statement.columns.push_back(columnName);
+                    if (matchSymbol(")")) {
+                        consume();
+                        break;
+                    }
+                    if (!expectSymbol(",", outError)) {
+                        return false;
+                    }
+                }
+            }
             if (!expectKeyword("VALUES", outError)) {
                 return false;
             }
@@ -273,23 +290,11 @@ public:
             }
             if (matchKeyword("WHERE")) {
                 consume();
-                while (true) {
-                    WhereClause where;
-                    if (!parseColumnToken(where.columnName, outError)) {
-                        return false;
-                    }
-                    if (!parseComparisonOperator(where.op, outError)) {
-                        return false;
-                    }
-                    if (!parseValue(where.value, outError)) {
-                        return false;
-                    }
-                    statement.whereClauses.push_back(where);
-                    if (!matchKeyword("AND")) {
-                        break;
-                    }
-                    consume();
+                WhereExpression whereExpression;
+                if (!parseWhereExpression(whereExpression, true, outError)) {
+                    return false;
                 }
+                statement.whereExpression = whereExpression;
             }
             if (matchKeyword("ORDER")) {
                 consume();
@@ -342,28 +347,30 @@ public:
             if (!expectKeyword("SET", outError)) {
                 return false;
             }
-            if (!parseIdentifier(statement.columnName, outError)) {
-                return false;
-            }
-            if (!expectSymbol("=", outError)) {
-                return false;
-            }
-            if (!parseValue(statement.value, outError)) {
-                return false;
+            while (true) {
+                UpdateSetClause setClause;
+                if (!parseIdentifier(setClause.columnName, outError)) {
+                    return false;
+                }
+                if (!expectSymbol("=", outError)) {
+                    return false;
+                }
+                if (!parseValue(setClause.value, outError)) {
+                    return false;
+                }
+                statement.setClauses.push_back(setClause);
+                if (!matchSymbol(",")) {
+                    break;
+                }
+                consume();
             }
             if (matchKeyword("WHERE")) {
                 consume();
-                WhereClause where;
-                if (!parseIdentifier(where.columnName, outError)) {
+                WhereExpression whereExpression;
+                if (!parseWhereExpression(whereExpression, false, outError)) {
                     return false;
                 }
-                if (!parseComparisonOperator(where.op, outError)) {
-                    return false;
-                }
-                if (!parseValue(where.value, outError)) {
-                    return false;
-                }
-                statement.where = where;
+                statement.whereExpression = whereExpression;
             }
             consumeSemicolonIfPresent();
             if (current_.kind != TokenKind::End) {
@@ -385,17 +392,11 @@ public:
             }
             if (matchKeyword("WHERE")) {
                 consume();
-                WhereClause where;
-                if (!parseIdentifier(where.columnName, outError)) {
+                WhereExpression whereExpression;
+                if (!parseWhereExpression(whereExpression, false, outError)) {
                     return false;
                 }
-                if (!parseComparisonOperator(where.op, outError)) {
-                    return false;
-                }
-                if (!parseValue(where.value, outError)) {
-                    return false;
-                }
-                statement.where = where;
+                statement.whereExpression = whereExpression;
             }
             consumeSemicolonIfPresent();
             if (current_.kind != TokenKind::End) {
@@ -411,6 +412,124 @@ public:
     }
 
 private:
+    bool parseWherePredicate(WhereExpression& outExpression, bool allowQualifiedColumns, std::string& outError) {
+        WhereClause where;
+        if (allowQualifiedColumns) {
+            if (!parseColumnToken(where.columnName, outError)) {
+                return false;
+            }
+        } else {
+            if (!parseIdentifier(where.columnName, outError)) {
+                return false;
+            }
+        }
+        if (!parseComparisonOperator(where.op, outError)) {
+            return false;
+        }
+        if (!parseValue(where.value, outError)) {
+            return false;
+        }
+        outExpression.kind = WhereExpressionKind::Predicate;
+        outExpression.predicate = where;
+        outExpression.children.clear();
+        return true;
+    }
+
+    bool parseWhereFactor(WhereExpression& outExpression, bool allowQualifiedColumns, std::string& outError) {
+        if (matchSymbol("(")) {
+            consume();
+            if (!parseWhereOrExpression(outExpression, allowQualifiedColumns, outError)) {
+                return false;
+            }
+            if (!expectSymbol(")", outError)) {
+                return false;
+            }
+            return true;
+        }
+        return parseWherePredicate(outExpression, allowQualifiedColumns, outError);
+    }
+
+    bool parseWhereUnaryExpression(WhereExpression& outExpression, bool allowQualifiedColumns, std::string& outError) {
+        if (matchKeyword("NOT")) {
+            consume();
+            WhereExpression child;
+            if (!parseWhereUnaryExpression(child, allowQualifiedColumns, outError)) {
+                return false;
+            }
+            outExpression.kind = WhereExpressionKind::Not;
+            outExpression.children.clear();
+            outExpression.children.push_back(std::move(child));
+            return true;
+        }
+        return parseWhereFactor(outExpression, allowQualifiedColumns, outError);
+    }
+
+    bool parseWhereAndExpression(WhereExpression& outExpression, bool allowQualifiedColumns, std::string& outError) {
+        if (!parseWhereUnaryExpression(outExpression, allowQualifiedColumns, outError)) {
+            return false;
+        }
+
+        while (matchKeyword("AND")) {
+            consume();
+            WhereExpression rightExpression;
+            if (!parseWhereUnaryExpression(rightExpression, allowQualifiedColumns, outError)) {
+                return false;
+            }
+            WhereExpression combined;
+            combined.kind = WhereExpressionKind::And;
+            combined.children.clear();
+            if (outExpression.kind == WhereExpressionKind::And) {
+                combined.children = outExpression.children;
+            } else {
+                combined.children.push_back(std::move(outExpression));
+            }
+            if (rightExpression.kind == WhereExpressionKind::And) {
+                for (auto& child : rightExpression.children) {
+                    combined.children.push_back(std::move(child));
+                }
+            } else {
+                combined.children.push_back(std::move(rightExpression));
+            }
+            outExpression = std::move(combined);
+        }
+        return true;
+    }
+
+    bool parseWhereOrExpression(WhereExpression& outExpression, bool allowQualifiedColumns, std::string& outError) {
+        if (!parseWhereAndExpression(outExpression, allowQualifiedColumns, outError)) {
+            return false;
+        }
+
+        while (matchKeyword("OR")) {
+            consume();
+            WhereExpression rightExpression;
+            if (!parseWhereAndExpression(rightExpression, allowQualifiedColumns, outError)) {
+                return false;
+            }
+            WhereExpression combined;
+            combined.kind = WhereExpressionKind::Or;
+            combined.children.clear();
+            if (outExpression.kind == WhereExpressionKind::Or) {
+                combined.children = outExpression.children;
+            } else {
+                combined.children.push_back(std::move(outExpression));
+            }
+            if (rightExpression.kind == WhereExpressionKind::Or) {
+                for (auto& child : rightExpression.children) {
+                    combined.children.push_back(std::move(child));
+                }
+            } else {
+                combined.children.push_back(std::move(rightExpression));
+            }
+            outExpression = std::move(combined);
+        }
+        return true;
+    }
+
+    bool parseWhereExpression(WhereExpression& outExpression, bool allowQualifiedColumns, std::string& outError) {
+        return parseWhereOrExpression(outExpression, allowQualifiedColumns, outError);
+    }
+
     void consume() {
         current_ = tokenizer_.next();
     }

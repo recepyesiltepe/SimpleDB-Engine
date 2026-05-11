@@ -17,6 +17,7 @@ struct CreateTableStatement {
 
 struct InsertStatement {
     std::string tableName;
+    std::vector<std::string> columns;
     std::vector<Value> values;
 };
 
@@ -41,16 +42,33 @@ struct WhereClause {
     Value value;
 };
 
-struct UpdateStatement {
-    std::string tableName;
+enum class WhereExpressionKind {
+    Predicate,
+    And,
+    Or,
+    Not,
+};
+
+struct WhereExpression {
+    WhereExpressionKind kind = WhereExpressionKind::Predicate;
+    WhereClause predicate;
+    std::vector<WhereExpression> children;
+};
+
+struct UpdateSetClause {
     std::string columnName;
     Value value;
-    std::optional<WhereClause> where;
+};
+
+struct UpdateStatement {
+    std::string tableName;
+    std::vector<UpdateSetClause> setClauses;
+    std::optional<WhereExpression> whereExpression;
 };
 
 struct DeleteStatement {
     std::string tableName;
-    std::optional<WhereClause> where;
+    std::optional<WhereExpression> whereExpression;
 };
 
 struct InnerJoinClause {
@@ -70,7 +88,7 @@ struct SelectStatement {
     bool selectAll = false;
     bool countAll = false;
     std::optional<InnerJoinClause> join;
-    std::vector<WhereClause> whereClauses;
+    std::optional<WhereExpression> whereExpression;
     std::optional<OrderByClause> orderBy;
     std::optional<std::size_t> limit;
 };

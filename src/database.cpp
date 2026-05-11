@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
+#include <functional>
 #include <fstream>
 #include <sstream>
 
@@ -484,19 +485,54 @@ bool Database::executeInsert(const InsertStatement& statement, std::string& outM
         return false;
     }
     auto& table = tableIt->second;
-    if (statement.values.size() != table.columns.size()) {
-        outMessage = "Column count mismatch for table " + statement.tableName;
-        return false;
-    }
-
-    Row row;
-    row.reserve(table.columns.size());
-    for (std::size_t i = 0; i < table.columns.size(); ++i) {
-        if (!isTypeCompatible(statement.values[i], table.columns[i].type)) {
-            outMessage = "Type mismatch at column " + table.columns[i].name;
+    Row row(table.columns.size());
+    if (statement.columns.empty()) {
+        if (statement.values.size() != table.columns.size()) {
+            outMessage = "Column count mismatch for table " + statement.tableName;
             return false;
         }
-        row.push_back(statement.values[i]);
+        for (std::size_t i = 0; i < table.columns.size(); ++i) {
+            if (!isTypeCompatible(statement.values[i], table.columns[i].type)) {
+                outMessage = "Type mismatch at column " + table.columns[i].name;
+                return false;
+            }
+            row[i] = statement.values[i];
+        }
+    } else {
+        if (statement.columns.size() != statement.values.size()) {
+            outMessage = "INSERT column/value count mismatch";
+            return false;
+        }
+        std::vector<bool> assigned(table.columns.size(), false);
+        for (std::size_t i = 0; i < statement.columns.size(); ++i) {
+            auto colIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
+                return equalsIgnoreCase(col.name, statement.columns[i]);
+            });
+            if (colIt == table.columns.end()) {
+                outMessage = "Unknown column: " + statement.columns[i];
+                return false;
+            }
+            std::size_t columnIndex = static_cast<std::size_t>(colIt - table.columns.begin());
+            if (assigned[columnIndex]) {
+                outMessage = "Duplicate INSERT column: " + colIt->name;
+                return false;
+            }
+            if (!isTypeCompatible(statement.values[i], colIt->type)) {
+                outMessage = "Type mismatch at column " + colIt->name;
+                return false;
+            }
+            row[columnIndex] = statement.values[i];
+            assigned[columnIndex] = true;
+        }
+        for (std::size_t i = 0; i < table.columns.size(); ++i) {
+            if (!assigned[i]) {
+                if (table.columns[i].type == ColumnType::Int64) {
+                    row[i] = static_cast<int64_t>(0);
+                } else {
+                    row[i] = std::string();
+                }
+            }
+        }
     }
 
     std::string diskError;
@@ -715,64 +751,126 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
             ComparisonOperator op = ComparisonOperator::Equal;
             Value value;
         };
-        std::vector<WhereBinding> whereBindings;
-        for (const auto& where : statement.whereClauses) {
-            std::string qualifier;
-            std::string column;
-            if (!parseQualifiedColumn(where.columnName, qualifier, column)) {
-                outMessage = "Invalid WHERE column: " + where.columnName;
-                return false;
-            }
+        struct BoundWhereExpression {
+            WhereExpressionKind kind = WhereExpressionKind::Predicate;
+            std::optional<WhereBinding> binding;
+            std::vector<BoundWhereExpression> children;
+        };
+        std::optional<BoundWhereExpression> whereExpression;
+        if (statement.whereExpression.has_value()) {
+            std::function<bool(const WhereExpression&, BoundWhereExpression&)> bindWhereExpression =
+                [&](const WhereExpression& whereExpressionInput, BoundWhereExpression& outBoundExpression) -> bool {
+                outBoundExpression.kind = whereExpressionInput.kind;
+                outBoundExpression.binding.reset();
+                outBoundExpression.children.clear();
 
-            auto resolveWhere = [&](const TableData& table, const std::string& colName, std::size_t& idx) -> bool {
-                auto it = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& c) {
-                    return equalsIgnoreCase(c.name, colName);
-                });
-                if (it == table.columns.end()) {
+                if (whereExpressionInput.kind == WhereExpressionKind::Predicate) {
+                    const auto& where = whereExpressionInput.predicate;
+                    std::string qualifier;
+                    std::string column;
+                    if (!parseQualifiedColumn(where.columnName, qualifier, column)) {
+                        outMessage = "Invalid WHERE column: " + where.columnName;
+                        return false;
+                    }
+
+                    auto resolveWhere = [&](const TableData& table, const std::string& colName, std::size_t& idx) -> bool {
+                        auto it = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& c) {
+                            return equalsIgnoreCase(c.name, colName);
+                        });
+                        if (it == table.columns.end()) {
+                            return false;
+                        }
+                        idx = static_cast<std::size_t>(it - table.columns.begin());
+                        return true;
+                    };
+
+                    std::size_t idx = 0;
+                    if (!qualifier.empty()) {
+                        if (equalsIgnoreCase(qualifier, statement.tableName) && resolveWhere(leftTable, column, idx)) {
+                            if (!isTypeCompatible(where.value, leftTable.columns[idx].type)) {
+                                outMessage = "WHERE value type mismatch";
+                                return false;
+                            }
+                            outBoundExpression.binding = WhereBinding{true, idx, where.op, where.value};
+                            return true;
+                        }
+                        if (equalsIgnoreCase(qualifier, join.tableName) && resolveWhere(rightTable, column, idx)) {
+                            if (!isTypeCompatible(where.value, rightTable.columns[idx].type)) {
+                                outMessage = "WHERE value type mismatch";
+                                return false;
+                            }
+                            outBoundExpression.binding = WhereBinding{false, idx, where.op, where.value};
+                            return true;
+                        }
+                        outMessage = "Unknown WHERE column: " + where.columnName;
+                        return false;
+                    }
+
+                    bool foundLeft = resolveWhere(leftTable, column, idx);
+                    if (foundLeft) {
+                        if (!isTypeCompatible(where.value, leftTable.columns[idx].type)) {
+                            outMessage = "WHERE value type mismatch";
+                            return false;
+                        }
+                        outBoundExpression.binding = WhereBinding{true, idx, where.op, where.value};
+                        return true;
+                    }
+                    if (resolveWhere(rightTable, column, idx)) {
+                        if (!isTypeCompatible(where.value, rightTable.columns[idx].type)) {
+                            outMessage = "WHERE value type mismatch";
+                            return false;
+                        }
+                        outBoundExpression.binding = WhereBinding{false, idx, where.op, where.value};
+                        return true;
+                    }
+                    outMessage = "Unknown WHERE column: " + where.columnName;
                     return false;
                 }
-                idx = static_cast<std::size_t>(it - table.columns.begin());
+
+                for (const auto& child : whereExpressionInput.children) {
+                    BoundWhereExpression boundChild;
+                    if (!bindWhereExpression(child, boundChild)) {
+                        return false;
+                    }
+                    outBoundExpression.children.push_back(std::move(boundChild));
+                }
                 return true;
             };
 
-            std::size_t idx = 0;
-            if (!qualifier.empty()) {
-                if (equalsIgnoreCase(qualifier, statement.tableName) && resolveWhere(leftTable, column, idx)) {
-                    if (!isTypeCompatible(where.value, leftTable.columns[idx].type)) {
-                        outMessage = "WHERE value type mismatch";
-                        return false;
-                    }
-                    whereBindings.push_back(WhereBinding{true, idx, where.op, where.value});
-                } else if (equalsIgnoreCase(qualifier, join.tableName) && resolveWhere(rightTable, column, idx)) {
-                    if (!isTypeCompatible(where.value, rightTable.columns[idx].type)) {
-                        outMessage = "WHERE value type mismatch";
-                        return false;
-                    }
-                    whereBindings.push_back(WhereBinding{false, idx, where.op, where.value});
-                } else {
-                    outMessage = "Unknown WHERE column: " + where.columnName;
-                    return false;
-                }
-            } else {
-                bool foundLeft = resolveWhere(leftTable, column, idx);
-                if (foundLeft) {
-                    if (!isTypeCompatible(where.value, leftTable.columns[idx].type)) {
-                        outMessage = "WHERE value type mismatch";
-                        return false;
-                    }
-                    whereBindings.push_back(WhereBinding{true, idx, where.op, where.value});
-                } else if (resolveWhere(rightTable, column, idx)) {
-                    if (!isTypeCompatible(where.value, rightTable.columns[idx].type)) {
-                        outMessage = "WHERE value type mismatch";
-                        return false;
-                    }
-                    whereBindings.push_back(WhereBinding{false, idx, where.op, where.value});
-                } else {
-                    outMessage = "Unknown WHERE column: " + where.columnName;
-                    return false;
-                }
+            BoundWhereExpression boundExpression;
+            if (!bindWhereExpression(statement.whereExpression.value(), boundExpression)) {
+                return false;
             }
+            whereExpression = std::move(boundExpression);
         }
+
+        std::function<bool(const BoundWhereExpression&, const Row&, const Row&)> evaluateWhereExpression =
+            [&](const BoundWhereExpression& expression, const Row& leftRow, const Row& rightRow) -> bool {
+            switch (expression.kind) {
+                case WhereExpressionKind::Predicate: {
+                    const auto& binding = expression.binding.value();
+                    const Value& current = binding.fromLeft ? leftRow[binding.index] : rightRow[binding.index];
+                    return evaluateComparison(current, binding.op, binding.value);
+                }
+                case WhereExpressionKind::And:
+                    for (const auto& child : expression.children) {
+                        if (!evaluateWhereExpression(child, leftRow, rightRow)) {
+                            return false;
+                        }
+                    }
+                    return true;
+                case WhereExpressionKind::Or:
+                    for (const auto& child : expression.children) {
+                        if (evaluateWhereExpression(child, leftRow, rightRow)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                case WhereExpressionKind::Not:
+                    return expression.children.empty() ? true : !evaluateWhereExpression(expression.children.front(), leftRow, rightRow);
+            }
+            return false;
+        };
 
         std::vector<std::pair<std::size_t, std::size_t>> matchedPairs;
         for (std::size_t leftRowId = 0; leftRowId < leftTable.rows.size(); ++leftRowId) {
@@ -782,15 +880,7 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
                 if (!equalsValue(leftRow[leftJoinIndex], rightRow[rightJoinIndex])) {
                     continue;
                 }
-                bool matchesAll = true;
-                for (const auto& binding : whereBindings) {
-                    const Value& current = binding.fromLeft ? leftRow[binding.index] : rightRow[binding.index];
-                    if (!evaluateComparison(current, binding.op, binding.value)) {
-                        matchesAll = false;
-                        break;
-                    }
-                }
-                if (!matchesAll) {
+                if (whereExpression.has_value() && !evaluateWhereExpression(whereExpression.value(), leftRow, rightRow)) {
                     continue;
                 }
                 matchedPairs.push_back({leftRowId, rightRowId});
@@ -915,88 +1005,100 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         }
     }
 
+    struct WhereBinding {
+        std::size_t index = 0;
+        ComparisonOperator op = ComparisonOperator::Equal;
+        Value value;
+    };
+    struct BoundWhereExpression {
+        WhereExpressionKind kind = WhereExpressionKind::Predicate;
+        std::optional<WhereBinding> binding;
+        std::vector<BoundWhereExpression> children;
+    };
+    std::optional<BoundWhereExpression> whereExpression;
+    if (statement.whereExpression.has_value()) {
+        std::function<bool(const WhereExpression&, BoundWhereExpression&)> bindWhereExpression =
+            [&](const WhereExpression& whereExpressionInput, BoundWhereExpression& outBoundExpression) -> bool {
+            outBoundExpression.kind = whereExpressionInput.kind;
+            outBoundExpression.binding.reset();
+            outBoundExpression.children.clear();
+
+            if (whereExpressionInput.kind == WhereExpressionKind::Predicate) {
+                const auto& where = whereExpressionInput.predicate;
+                std::string qualifier;
+                std::string whereName;
+                if (!parseQualifiedColumn(where.columnName, qualifier, whereName)) {
+                    outMessage = "Invalid WHERE column: " + where.columnName;
+                    return false;
+                }
+                if (!qualifier.empty() && !equalsIgnoreCase(qualifier, statement.tableName)) {
+                    outMessage = "Unknown WHERE column: " + where.columnName;
+                    return false;
+                }
+                auto whereColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
+                    return equalsIgnoreCase(col.name, whereName);
+                });
+                if (whereColIt == table.columns.end()) {
+                    outMessage = "Unknown WHERE column: " + where.columnName;
+                    return false;
+                }
+                if (!isTypeCompatible(where.value, whereColIt->type)) {
+                    outMessage = "WHERE value type mismatch for column " + whereColIt->name;
+                    return false;
+                }
+                outBoundExpression.binding = WhereBinding{static_cast<std::size_t>(whereColIt - table.columns.begin()), where.op, where.value};
+                return true;
+            }
+
+            for (const auto& child : whereExpressionInput.children) {
+                BoundWhereExpression boundChild;
+                if (!bindWhereExpression(child, boundChild)) {
+                    return false;
+                }
+                outBoundExpression.children.push_back(std::move(boundChild));
+            }
+            return true;
+        };
+
+        BoundWhereExpression boundExpression;
+        if (!bindWhereExpression(statement.whereExpression.value(), boundExpression)) {
+            return false;
+        }
+        whereExpression = std::move(boundExpression);
+    }
+
+    std::function<bool(const BoundWhereExpression&, const Row&)> evaluateWhereExpression =
+        [&](const BoundWhereExpression& expression, const Row& row) -> bool {
+        switch (expression.kind) {
+            case WhereExpressionKind::Predicate: {
+                const auto& binding = expression.binding.value();
+                return evaluateComparison(row[binding.index], binding.op, binding.value);
+            }
+            case WhereExpressionKind::And:
+                for (const auto& child : expression.children) {
+                    if (!evaluateWhereExpression(child, row)) {
+                        return false;
+                    }
+                }
+                return true;
+            case WhereExpressionKind::Or:
+                for (const auto& child : expression.children) {
+                    if (evaluateWhereExpression(child, row)) {
+                        return true;
+                    }
+                }
+                return false;
+            case WhereExpressionKind::Not:
+                return expression.children.empty() ? true : !evaluateWhereExpression(expression.children.front(), row);
+        }
+        return false;
+    };
+
     std::vector<std::size_t> candidateRows;
     candidateRows.reserve(table.rows.size());
     for (std::size_t rowId = 0; rowId < table.rows.size(); ++rowId) {
-        candidateRows.push_back(rowId);
-    }
-
-    for (const auto& where : statement.whereClauses) {
-        std::string qualifier;
-        std::string whereName;
-        if (!parseQualifiedColumn(where.columnName, qualifier, whereName)) {
-            outMessage = "Invalid WHERE column: " + where.columnName;
-            return false;
-        }
-        if (!qualifier.empty() && !equalsIgnoreCase(qualifier, statement.tableName)) {
-            outMessage = "Unknown WHERE column: " + where.columnName;
-            return false;
-        }
-        auto whereColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
-            return equalsIgnoreCase(col.name, whereName);
-        });
-        if (whereColIt == table.columns.end()) {
-            outMessage = "Unknown WHERE column: " + where.columnName;
-            return false;
-        }
-        std::size_t whereIndex = static_cast<std::size_t>(whereColIt - table.columns.begin());
-        if (!isTypeCompatible(where.value, whereColIt->type)) {
-            outMessage = "WHERE value type mismatch for column " + whereColIt->name;
-            return false;
-        }
-
-        bool usedIndex = false;
-        if (whereColIt->type == ColumnType::Int64 && candidateRows.size() == table.rows.size()) {
-            const auto* matchingIndex = static_cast<const IndexInfo*>(nullptr);
-            for (const auto& index : table.indexes) {
-                if (index.columnIndex == whereIndex) {
-                    matchingIndex = &index;
-                    break;
-                }
-            }
-            if (matchingIndex != nullptr) {
-                int64_t needle = std::get<int64_t>(where.value);
-                switch (where.op) {
-                    case ComparisonOperator::Equal:
-                        candidateRows = matchingIndex->tree.searchEqual(needle);
-                        usedIndex = true;
-                        break;
-                    case ComparisonOperator::Less:
-                        candidateRows = matchingIndex->tree.searchRange(std::nullopt, false, needle, false);
-                        usedIndex = true;
-                        break;
-                    case ComparisonOperator::LessEqual:
-                        candidateRows = matchingIndex->tree.searchRange(std::nullopt, false, needle, true);
-                        usedIndex = true;
-                        break;
-                    case ComparisonOperator::Greater:
-                        candidateRows = matchingIndex->tree.searchRange(needle, false, std::nullopt, false);
-                        usedIndex = true;
-                        break;
-                    case ComparisonOperator::GreaterEqual:
-                        candidateRows = matchingIndex->tree.searchRange(needle, true, std::nullopt, false);
-                        usedIndex = true;
-                        break;
-                    case ComparisonOperator::NotEqual: {
-                        candidateRows = matchingIndex->tree.searchRange(std::nullopt, false, needle, false);
-                        std::vector<std::size_t> tail = matchingIndex->tree.searchRange(needle, false, std::nullopt, false);
-                        candidateRows.insert(candidateRows.end(), tail.begin(), tail.end());
-                        usedIndex = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (!usedIndex) {
-            std::vector<std::size_t> filtered;
-            filtered.reserve(candidateRows.size());
-            for (std::size_t rowId : candidateRows) {
-                if (evaluateComparison(table.rows[rowId][whereIndex], where.op, where.value)) {
-                    filtered.push_back(rowId);
-                }
-            }
-            candidateRows = std::move(filtered);
+        if (!whereExpression.has_value() || evaluateWhereExpression(whereExpression.value(), table.rows[rowId])) {
+            candidateRows.push_back(rowId);
         }
     }
 
@@ -1068,49 +1170,126 @@ bool Database::executeUpdate(const UpdateStatement& statement, std::string& outM
     }
     auto& table = tableIt->second;
 
-    auto targetColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
-        return equalsIgnoreCase(col.name, statement.columnName);
-    });
-    if (targetColIt == table.columns.end()) {
-        outMessage = "Unknown column: " + statement.columnName;
-        return false;
-    }
-    std::size_t targetIndex = static_cast<std::size_t>(targetColIt - table.columns.begin());
-    if (!isTypeCompatible(statement.value, targetColIt->type)) {
-        outMessage = "Type mismatch for SET column " + targetColIt->name;
+    if (statement.setClauses.empty()) {
+        outMessage = "UPDATE requires at least one SET clause";
         return false;
     }
 
-    std::optional<std::size_t> whereIndex;
-    if (statement.where.has_value()) {
-        const auto& where = statement.where.value();
-        auto whereColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
-            return equalsIgnoreCase(col.name, where.columnName);
+    struct SetBinding {
+        std::size_t index = 0;
+        Value value;
+    };
+    std::vector<SetBinding> setBindings;
+    std::vector<bool> setSeen(table.columns.size(), false);
+    for (const auto& setClause : statement.setClauses) {
+        auto targetColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
+            return equalsIgnoreCase(col.name, setClause.columnName);
         });
-        if (whereColIt == table.columns.end()) {
-            outMessage = "Unknown WHERE column: " + where.columnName;
+        if (targetColIt == table.columns.end()) {
+            outMessage = "Unknown column: " + setClause.columnName;
             return false;
         }
-        if (!isTypeCompatible(where.value, whereColIt->type)) {
-            outMessage = "WHERE value type mismatch for column " + whereColIt->name;
+        std::size_t targetIndex = static_cast<std::size_t>(targetColIt - table.columns.begin());
+        if (setSeen[targetIndex]) {
+            outMessage = "Duplicate SET column: " + targetColIt->name;
             return false;
         }
-        whereIndex = static_cast<std::size_t>(whereColIt - table.columns.begin());
+        if (!isTypeCompatible(setClause.value, targetColIt->type)) {
+            outMessage = "Type mismatch for SET column " + targetColIt->name;
+            return false;
+        }
+        setSeen[targetIndex] = true;
+        setBindings.push_back({targetIndex, setClause.value});
     }
+
+    struct WhereBinding {
+        std::size_t index = 0;
+        ComparisonOperator op = ComparisonOperator::Equal;
+        Value value;
+    };
+    struct BoundWhereExpression {
+        WhereExpressionKind kind = WhereExpressionKind::Predicate;
+        std::optional<WhereBinding> binding;
+        std::vector<BoundWhereExpression> children;
+    };
+    std::optional<BoundWhereExpression> whereExpression;
+    if (statement.whereExpression.has_value()) {
+        std::function<bool(const WhereExpression&, BoundWhereExpression&)> bindWhereExpression =
+            [&](const WhereExpression& whereExpressionInput, BoundWhereExpression& outBoundExpression) -> bool {
+            outBoundExpression.kind = whereExpressionInput.kind;
+            outBoundExpression.binding.reset();
+            outBoundExpression.children.clear();
+
+            if (whereExpressionInput.kind == WhereExpressionKind::Predicate) {
+                const auto& where = whereExpressionInput.predicate;
+                auto whereColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
+                    return equalsIgnoreCase(col.name, where.columnName);
+                });
+                if (whereColIt == table.columns.end()) {
+                    outMessage = "Unknown WHERE column: " + where.columnName;
+                    return false;
+                }
+                if (!isTypeCompatible(where.value, whereColIt->type)) {
+                    outMessage = "WHERE value type mismatch for column " + whereColIt->name;
+                    return false;
+                }
+                outBoundExpression.binding = WhereBinding{static_cast<std::size_t>(whereColIt - table.columns.begin()), where.op, where.value};
+                return true;
+            }
+
+            for (const auto& child : whereExpressionInput.children) {
+                BoundWhereExpression boundChild;
+                if (!bindWhereExpression(child, boundChild)) {
+                    return false;
+                }
+                outBoundExpression.children.push_back(std::move(boundChild));
+            }
+            return true;
+        };
+
+        BoundWhereExpression boundExpression;
+        if (!bindWhereExpression(statement.whereExpression.value(), boundExpression)) {
+            return false;
+        }
+        whereExpression = std::move(boundExpression);
+    }
+
+    std::function<bool(const BoundWhereExpression&, const Row&)> evaluateWhereExpression =
+        [&](const BoundWhereExpression& expression, const Row& row) -> bool {
+        switch (expression.kind) {
+            case WhereExpressionKind::Predicate: {
+                const auto& binding = expression.binding.value();
+                return evaluateComparison(row[binding.index], binding.op, binding.value);
+            }
+            case WhereExpressionKind::And:
+                for (const auto& child : expression.children) {
+                    if (!evaluateWhereExpression(child, row)) {
+                        return false;
+                    }
+                }
+                return true;
+            case WhereExpressionKind::Or:
+                for (const auto& child : expression.children) {
+                    if (evaluateWhereExpression(child, row)) {
+                        return true;
+                    }
+                }
+                return false;
+            case WhereExpressionKind::Not:
+                return expression.children.empty() ? true : !evaluateWhereExpression(expression.children.front(), row);
+        }
+        return false;
+    };
 
     std::size_t updated = 0;
     for (auto& row : table.rows) {
-        bool matches = true;
-        if (whereIndex.has_value()) {
-            matches = evaluateComparison(
-                row[whereIndex.value()],
-                statement.where.value().op,
-                statement.where.value().value);
-        }
+        bool matches = !whereExpression.has_value() || evaluateWhereExpression(whereExpression.value(), row);
         if (!matches) {
             continue;
         }
-        row[targetIndex] = statement.value;
+        for (const auto& setBinding : setBindings) {
+            row[setBinding.index] = setBinding.value;
+        }
         ++updated;
     }
 
@@ -1132,34 +1311,90 @@ bool Database::executeDelete(const DeleteStatement& statement, std::string& outM
     }
     auto& table = tableIt->second;
 
-    std::optional<std::size_t> whereIndex;
-    if (statement.where.has_value()) {
-        const auto& where = statement.where.value();
-        auto whereColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
-            return equalsIgnoreCase(col.name, where.columnName);
-        });
-        if (whereColIt == table.columns.end()) {
-            outMessage = "Unknown WHERE column: " + where.columnName;
+    struct WhereBinding {
+        std::size_t index = 0;
+        ComparisonOperator op = ComparisonOperator::Equal;
+        Value value;
+    };
+    struct BoundWhereExpression {
+        WhereExpressionKind kind = WhereExpressionKind::Predicate;
+        std::optional<WhereBinding> binding;
+        std::vector<BoundWhereExpression> children;
+    };
+    std::optional<BoundWhereExpression> whereExpression;
+    if (statement.whereExpression.has_value()) {
+        std::function<bool(const WhereExpression&, BoundWhereExpression&)> bindWhereExpression =
+            [&](const WhereExpression& whereExpressionInput, BoundWhereExpression& outBoundExpression) -> bool {
+            outBoundExpression.kind = whereExpressionInput.kind;
+            outBoundExpression.binding.reset();
+            outBoundExpression.children.clear();
+
+            if (whereExpressionInput.kind == WhereExpressionKind::Predicate) {
+                const auto& where = whereExpressionInput.predicate;
+                auto whereColIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& col) {
+                    return equalsIgnoreCase(col.name, where.columnName);
+                });
+                if (whereColIt == table.columns.end()) {
+                    outMessage = "Unknown WHERE column: " + where.columnName;
+                    return false;
+                }
+                if (!isTypeCompatible(where.value, whereColIt->type)) {
+                    outMessage = "WHERE value type mismatch for column " + whereColIt->name;
+                    return false;
+                }
+                outBoundExpression.binding = WhereBinding{static_cast<std::size_t>(whereColIt - table.columns.begin()), where.op, where.value};
+                return true;
+            }
+
+            for (const auto& child : whereExpressionInput.children) {
+                BoundWhereExpression boundChild;
+                if (!bindWhereExpression(child, boundChild)) {
+                    return false;
+                }
+                outBoundExpression.children.push_back(std::move(boundChild));
+            }
+            return true;
+        };
+
+        BoundWhereExpression boundExpression;
+        if (!bindWhereExpression(statement.whereExpression.value(), boundExpression)) {
             return false;
         }
-        if (!isTypeCompatible(where.value, whereColIt->type)) {
-            outMessage = "WHERE value type mismatch for column " + whereColIt->name;
-            return false;
-        }
-        whereIndex = static_cast<std::size_t>(whereColIt - table.columns.begin());
+        whereExpression = std::move(boundExpression);
     }
+
+    std::function<bool(const BoundWhereExpression&, const Row&)> evaluateWhereExpression =
+        [&](const BoundWhereExpression& expression, const Row& row) -> bool {
+        switch (expression.kind) {
+            case WhereExpressionKind::Predicate: {
+                const auto& binding = expression.binding.value();
+                return evaluateComparison(row[binding.index], binding.op, binding.value);
+            }
+            case WhereExpressionKind::And:
+                for (const auto& child : expression.children) {
+                    if (!evaluateWhereExpression(child, row)) {
+                        return false;
+                    }
+                }
+                return true;
+            case WhereExpressionKind::Or:
+                for (const auto& child : expression.children) {
+                    if (evaluateWhereExpression(child, row)) {
+                        return true;
+                    }
+                }
+                return false;
+            case WhereExpressionKind::Not:
+                return expression.children.empty() ? true : !evaluateWhereExpression(expression.children.front(), row);
+        }
+        return false;
+    };
 
     std::vector<Row> keptRows;
     keptRows.reserve(table.rows.size());
     std::size_t deleted = 0;
     for (const auto& row : table.rows) {
-        bool matches = true;
-        if (whereIndex.has_value()) {
-            matches = evaluateComparison(
-                row[whereIndex.value()],
-                statement.where.value().op,
-                statement.where.value().value);
-        }
+        bool matches = !whereExpression.has_value() || evaluateWhereExpression(whereExpression.value(), row);
         if (matches) {
             ++deleted;
         } else {
