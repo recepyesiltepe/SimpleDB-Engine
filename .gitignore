@@ -1,24 +1,47 @@
-# Build directories
+# Build outputs
 /build/
+/out/
+/cmake-build-*/
 
-# CMake artifacts
+# CMake generated files
 /CMakeCache.txt
 /CMakeFiles/
+/Testing/
+/CTestTestfile.cmake
+/DartConfiguration.tcl
 /cmake_install.cmake
 /compile_commands.json
 /Makefile
+/*.cmake
 
-# Binary output
+# Binaries and libraries
 /simpledb
-
-# Object and library files
-*.o
-*.obj
-*.a
+/simpledb_tests
+*.exe
+*.dll
 *.so
 *.dylib
-*.dll
-*.exe
+*.a
+*.lib
+*.o
+*.obj
+*.pdb
+*.ilk
+*.exp
 
-# Runtime data
+# Runtime data and generated release artifacts
 /data/
+/release-assets/
+*.tar.gz
+*.zip
+
+# Logs, temporary files, and OS/editor noise
+*.log
+*.tmp
+*.bak
+*.swp
+*~
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
