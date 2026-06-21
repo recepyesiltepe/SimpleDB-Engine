@@ -51,6 +51,8 @@ private:
     bool executeCreateTable(const CreateTableStatement& statement, std::string& outMessage);
     bool executeInsert(const InsertStatement& statement, std::string& outMessage);
     bool executeCreateIndex(const CreateIndexStatement& statement, std::string& outMessage);
+    bool executeDropTable(const DropTableStatement& statement, std::string& outMessage);
+    bool executeDescribeTable(const DescribeTableStatement& statement, std::optional<SelectResult>& outSelectResult, std::string& outMessage);
     bool executeSelect(const SelectStatement& statement, std::optional<SelectResult>& outSelectResult, std::string& outMessage);
     bool executeUpdate(const UpdateStatement& statement, std::string& outMessage);
     bool executeDelete(const DeleteStatement& statement, std::string& outMessage);

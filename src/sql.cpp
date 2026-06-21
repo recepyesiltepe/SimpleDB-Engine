@@ -172,6 +172,40 @@ public:
             return false;
         }
 
+        if (matchKeyword("DROP")) {
+            consume();
+            if (!expectKeyword("TABLE", outError)) {
+                return false;
+            }
+
+            DropTableStatement statement;
+            if (!parseIdentifier(statement.tableName, outError)) {
+                return false;
+            }
+            consumeSemicolonIfPresent();
+            if (current_.kind != TokenKind::End) {
+                outError = "Unexpected trailing tokens";
+                return false;
+            }
+            outStatement = statement;
+            return true;
+        }
+
+        if (matchKeyword("DESCRIBE") || matchKeyword("DESC")) {
+            consume();
+            DescribeTableStatement statement;
+            if (!parseIdentifier(statement.tableName, outError)) {
+                return false;
+            }
+            consumeSemicolonIfPresent();
+            if (current_.kind != TokenKind::End) {
+                outError = "Unexpected trailing tokens";
+                return false;
+            }
+            outStatement = statement;
+            return true;
+        }
+
         if (matchKeyword("INSERT")) {
             consume();
             if (!expectKeyword("INTO", outError)) {

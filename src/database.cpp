@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <functional>
 #include <fstream>
+#include <iterator>
 #include <sstream>
 
 namespace simpledb {
@@ -444,6 +445,12 @@ bool Database::execute(const Statement& statement, std::string& outMessage, std:
     if (std::holds_alternative<CreateIndexStatement>(statement)) {
         return executeCreateIndex(std::get<CreateIndexStatement>(statement), outMessage);
     }
+    if (std::holds_alternative<DropTableStatement>(statement)) {
+        return executeDropTable(std::get<DropTableStatement>(statement), outMessage);
+    }
+    if (std::holds_alternative<DescribeTableStatement>(statement)) {
+        return executeDescribeTable(std::get<DescribeTableStatement>(statement), outSelectResult, outMessage);
+    }
     if (std::holds_alternative<UpdateStatement>(statement)) {
         return executeUpdate(std::get<UpdateStatement>(statement), outMessage);
     }
@@ -599,6 +606,66 @@ bool Database::executeCreateIndex(const CreateIndexStatement& statement, std::st
     }
 
     outMessage = "Index created: " + statement.indexName;
+    return true;
+}
+
+bool Database::executeDropTable(const DropTableStatement& statement, std::string& outMessage) {
+    auto tableIt = tables_.find(statement.tableName);
+    if (tableIt == tables_.end()) {
+        outMessage = "Unknown table: " + statement.tableName;
+        return false;
+    }
+
+    TableData droppedTable = std::move(tableIt->second);
+    tables_.erase(tableIt);
+
+    std::string persistError;
+    if (!persistCatalog(persistError)) {
+        tables_[statement.tableName] = std::move(droppedTable);
+        outMessage = persistError;
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::remove(tablePath(dataDir_, statement.tableName), ec);
+    if (ec) {
+        outMessage = "Failed to remove table data file: " + ec.message();
+        return false;
+    }
+
+    outMessage = "Table dropped: " + statement.tableName;
+    return true;
+}
+
+bool Database::executeDescribeTable(const DescribeTableStatement& statement, std::optional<SelectResult>& outSelectResult, std::string& outMessage) {
+    auto tableIt = tables_.find(statement.tableName);
+    if (tableIt == tables_.end()) {
+        outMessage = "Unknown table: " + statement.tableName;
+        return false;
+    }
+
+    const auto& table = tableIt->second;
+    SelectResult result;
+    result.columnNames = {"column", "type", "index"};
+    for (std::size_t columnIndex = 0; columnIndex < table.columns.size(); ++columnIndex) {
+        const auto& column = table.columns[columnIndex];
+        std::string indexName;
+        auto indexIt = std::find_if(table.indexes.begin(), table.indexes.end(), [&](const IndexInfo& index) {
+            return index.columnIndex == columnIndex;
+        });
+        if (indexIt != table.indexes.end()) {
+            indexName = indexIt->name;
+        }
+
+        Row row;
+        row.push_back(column.name);
+        row.push_back(columnTypeToString(column.type));
+        row.push_back(indexName);
+        result.rows.push_back(std::move(row));
+    }
+
+    outMessage = std::to_string(result.rows.size()) + " column(s)";
+    outSelectResult = std::move(result);
     return true;
 }
 
@@ -1094,12 +1161,107 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
         return false;
     };
 
+    auto normalizeRowIds = [](std::vector<std::size_t> rowIds) {
+        std::sort(rowIds.begin(), rowIds.end());
+        rowIds.erase(std::unique(rowIds.begin(), rowIds.end()), rowIds.end());
+        return rowIds;
+    };
+
+    auto findIndexForColumn = [&](std::size_t columnIndex) -> const IndexInfo* {
+        auto indexIt = std::find_if(table.indexes.begin(), table.indexes.end(), [&](const IndexInfo& index) {
+            return index.columnIndex == columnIndex;
+        });
+        if (indexIt == table.indexes.end()) {
+            return nullptr;
+        }
+        return &(*indexIt);
+    };
+
+    std::function<std::optional<std::vector<std::size_t>>(const BoundWhereExpression&)> indexedCandidatesForExpression =
+        [&](const BoundWhereExpression& expression) -> std::optional<std::vector<std::size_t>> {
+        switch (expression.kind) {
+            case WhereExpressionKind::Predicate: {
+                const auto& binding = expression.binding.value();
+                const IndexInfo* index = findIndexForColumn(binding.index);
+                if (index == nullptr || !std::holds_alternative<int64_t>(binding.value)) {
+                    return std::nullopt;
+                }
+
+                int64_t value = std::get<int64_t>(binding.value);
+                switch (binding.op) {
+                    case ComparisonOperator::Equal:
+                        return normalizeRowIds(index->tree.searchEqual(value));
+                    case ComparisonOperator::Less:
+                        return normalizeRowIds(index->tree.searchRange(std::nullopt, false, value, false));
+                    case ComparisonOperator::LessEqual:
+                        return normalizeRowIds(index->tree.searchRange(std::nullopt, false, value, true));
+                    case ComparisonOperator::Greater:
+                        return normalizeRowIds(index->tree.searchRange(value, false, std::nullopt, false));
+                    case ComparisonOperator::GreaterEqual:
+                        return normalizeRowIds(index->tree.searchRange(value, true, std::nullopt, false));
+                    case ComparisonOperator::NotEqual: {
+                        std::vector<std::size_t> rowIds = index->tree.searchRange(std::nullopt, false, value, false);
+                        std::vector<std::size_t> greaterRows = index->tree.searchRange(value, false, std::nullopt, false);
+                        rowIds.insert(rowIds.end(), greaterRows.begin(), greaterRows.end());
+                        return normalizeRowIds(std::move(rowIds));
+                    }
+                }
+                return std::nullopt;
+            }
+            case WhereExpressionKind::And: {
+                std::optional<std::vector<std::size_t>> combined;
+                for (const auto& child : expression.children) {
+                    auto childCandidates = indexedCandidatesForExpression(child);
+                    if (!childCandidates.has_value()) {
+                        continue;
+                    }
+                    if (!combined.has_value()) {
+                        combined = std::move(childCandidates.value());
+                        continue;
+                    }
+                    std::vector<std::size_t> intersection;
+                    std::set_intersection(combined->begin(), combined->end(),
+                                          childCandidates->begin(), childCandidates->end(),
+                                          std::back_inserter(intersection));
+                    combined = std::move(intersection);
+                }
+                return combined;
+            }
+            case WhereExpressionKind::Or: {
+                std::vector<std::size_t> combined;
+                for (const auto& child : expression.children) {
+                    auto childCandidates = indexedCandidatesForExpression(child);
+                    if (!childCandidates.has_value()) {
+                        return std::nullopt;
+                    }
+                    combined.insert(combined.end(), childCandidates->begin(), childCandidates->end());
+                }
+                return normalizeRowIds(std::move(combined));
+            }
+            case WhereExpressionKind::Not:
+                return std::nullopt;
+        }
+        return std::nullopt;
+    };
+
     std::vector<std::size_t> candidateRows;
-    candidateRows.reserve(table.rows.size());
-    for (std::size_t rowId = 0; rowId < table.rows.size(); ++rowId) {
-        if (!whereExpression.has_value() || evaluateWhereExpression(whereExpression.value(), table.rows[rowId])) {
+    std::optional<std::vector<std::size_t>> indexedCandidates;
+    if (whereExpression.has_value()) {
+        indexedCandidates = indexedCandidatesForExpression(whereExpression.value());
+    }
+
+    if (indexedCandidates.has_value()) {
+        candidateRows = std::move(indexedCandidates.value());
+    } else {
+        candidateRows.reserve(table.rows.size());
+        for (std::size_t rowId = 0; rowId < table.rows.size(); ++rowId) {
             candidateRows.push_back(rowId);
         }
+    }
+    if (whereExpression.has_value()) {
+        candidateRows.erase(std::remove_if(candidateRows.begin(), candidateRows.end(), [&](std::size_t rowId) {
+            return !evaluateWhereExpression(whereExpression.value(), table.rows[rowId]);
+        }), candidateRows.end());
     }
 
     if (statement.orderBy.has_value()) {
