@@ -31,8 +31,17 @@ struct DropTableStatement {
     std::string tableName;
 };
 
+struct DropIndexStatement {
+    std::string indexName;
+};
+
 struct DescribeTableStatement {
     std::string tableName;
+};
+
+struct AlterTableAddColumnStatement {
+    std::string tableName;
+    Column column;
 };
 
 enum class ComparisonOperator {
@@ -102,7 +111,8 @@ struct SelectStatement {
 };
 
 using Statement = std::variant<CreateTableStatement, InsertStatement, CreateIndexStatement, DropTableStatement,
-                               DescribeTableStatement, SelectStatement, UpdateStatement, DeleteStatement>;
+                               DropIndexStatement, DescribeTableStatement, AlterTableAddColumnStatement,
+                               SelectStatement, UpdateStatement, DeleteStatement>;
 
 bool tryParseStatement(const std::string& sql, Statement& outStatement, std::string& outError);
 

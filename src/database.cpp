@@ -52,6 +52,118 @@ bool writeUInt32(std::ofstream& out, uint32_t value) {
     return out.good();
 }
 
+bool writeFileAtomically(const std::filesystem::path& targetPath, std::ios::openmode mode,
+                         const std::function<bool(std::ofstream&, std::string&)>& writer,
+                         std::string& outError) {
+    std::filesystem::path tempPath = targetPath;
+    tempPath += ".tmp";
+
+    std::error_code ec;
+    std::filesystem::remove(tempPath, ec);
+
+    std::ofstream out(tempPath, mode | std::ios::trunc);
+    if (!out.is_open()) {
+        outError = "Failed to open temporary file: " + tempPath.string();
+        return false;
+    }
+
+    if (!writer(out, outError)) {
+        out.close();
+        std::filesystem::remove(tempPath, ec);
+        return false;
+    }
+
+    out.flush();
+    if (!out.good()) {
+        out.close();
+        std::filesystem::remove(tempPath, ec);
+        outError = "Failed while writing temporary file: " + tempPath.string();
+        return false;
+    }
+    out.close();
+    if (out.fail()) {
+        std::filesystem::remove(tempPath, ec);
+        outError = "Failed to close temporary file: " + tempPath.string();
+        return false;
+    }
+
+#ifdef _WIN32
+    std::filesystem::path backupPath = targetPath;
+    backupPath += ".bak";
+    std::filesystem::remove(backupPath, ec);
+    ec.clear();
+
+    const bool targetExists = std::filesystem::exists(targetPath, ec);
+    if (ec) {
+        std::filesystem::remove(tempPath, ec);
+        outError = "Failed to inspect file " + targetPath.string() + ": " + ec.message();
+        return false;
+    }
+
+    if (targetExists) {
+        std::filesystem::rename(targetPath, backupPath, ec);
+        if (ec) {
+            std::filesystem::remove(tempPath, ec);
+            outError = "Failed to prepare replacement for " + targetPath.string() + ": " + ec.message();
+            return false;
+        }
+    }
+
+    std::filesystem::rename(tempPath, targetPath, ec);
+    if (ec) {
+        std::error_code cleanupError;
+        std::filesystem::remove(tempPath, cleanupError);
+        if (targetExists) {
+            std::filesystem::rename(backupPath, targetPath, cleanupError);
+        }
+        outError = "Failed to replace file " + targetPath.string() + ": " + ec.message();
+        return false;
+    }
+
+    if (targetExists) {
+        std::error_code cleanupError;
+        std::filesystem::remove(backupPath, cleanupError);
+    }
+#else
+    std::filesystem::rename(tempPath, targetPath, ec);
+    if (ec) {
+        std::error_code removeError;
+        std::filesystem::remove(tempPath, removeError);
+        outError = "Failed to replace file " + targetPath.string() + ": " + ec.message();
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool recoverPartialTrailingRow(std::ifstream& in, const std::filesystem::path& path, std::streampos rowStart,
+                               const std::string& tableName, std::string& outError) {
+    if (!in.eof()) {
+        return false;
+    }
+
+    std::uintmax_t fileSize = 0;
+    std::error_code ec;
+    fileSize = std::filesystem::file_size(path, ec);
+    if (ec) {
+        outError = "Failed to inspect table data file for recovery: " + tableName + ": " + ec.message();
+        return false;
+    }
+
+    const auto completeSize = static_cast<std::uintmax_t>(static_cast<std::streamoff>(rowStart));
+    if (completeSize == fileSize) {
+        return true;
+    }
+
+    in.close();
+    std::filesystem::resize_file(path, completeSize, ec);
+    if (ec) {
+        outError = "Failed to truncate partial row for table " + tableName + ": " + ec.message();
+        return false;
+    }
+    return true;
+}
+
 bool equalsValue(const Value& left, const Value& right) {
     if (left.index() != right.index()) {
         return false;
@@ -204,16 +316,50 @@ bool Database::loadCatalog(std::string& outError) {
                 return false;
             }
             TableData table;
+            std::string pendingToken;
             for (std::size_t i = 0; i < columnCount; ++i) {
                 Column column;
                 std::string typeText;
-                iss >> column.name >> typeText;
+                if (!pendingToken.empty()) {
+                    column.name = pendingToken;
+                    pendingToken.clear();
+                    iss >> typeText;
+                } else {
+                    iss >> column.name >> typeText;
+                }
                 if (column.name.empty()) {
                     outError = "Malformed column entry in catalog";
                     return false;
                 }
                 if (!tryParseColumnType(typeText, column.type)) {
                     outError = "Unknown column type in catalog: " + typeText;
+                    return false;
+                }
+                std::string token;
+                while (iss >> token) {
+                    const std::string upperToken = toUpper(token);
+                    if (upperToken == "NOT_NULL") {
+                        column.notNull = true;
+                        continue;
+                    }
+                    if (upperToken == "NOT") {
+                        std::string nullToken;
+                        if (!(iss >> nullToken) || toUpper(nullToken) != "NULL") {
+                            outError = "Expected NULL after NOT in catalog";
+                            return false;
+                        }
+                        column.notNull = true;
+                        continue;
+                    }
+                    if (upperToken == "UNIQUE") {
+                        column.unique = true;
+                        continue;
+                    }
+                    pendingToken = token;
+                    break;
+                }
+                if (i + 1 == columnCount && !pendingToken.empty()) {
+                    outError = "Malformed TABLE entry in catalog";
                     return false;
                 }
                 table.columns.push_back(column);
@@ -265,35 +411,37 @@ bool Database::loadCatalog(std::string& outError) {
 }
 
 bool Database::persistCatalog(std::string& outError) const {
-    std::ofstream out(catalogPath(dataDir_), std::ios::trunc);
-    if (!out.is_open()) {
-        outError = "Failed to write catalog";
-        return false;
-    }
-
-    for (const auto& pair : tables_) {
-        const auto& tableName = pair.first;
-        const auto& table = pair.second;
-        out << "TABLE " << tableName << " " << table.columns.size();
-        for (const auto& column : table.columns) {
-            out << " " << column.name << " " << columnTypeToString(column.type);
+    return writeFileAtomically(catalogPath(dataDir_), std::ios::out, [&](std::ofstream& out, std::string& writerError) {
+        for (const auto& pair : tables_) {
+            const auto& tableName = pair.first;
+            const auto& table = pair.second;
+            out << "TABLE " << tableName << " " << table.columns.size();
+            for (const auto& column : table.columns) {
+                out << " " << column.name << " " << columnTypeToString(column.type);
+                if (column.notNull) {
+                    out << " NOT_NULL";
+                }
+                if (column.unique) {
+                    out << " UNIQUE";
+                }
+            }
+            out << "\n";
         }
-        out << "\n";
-    }
 
-    for (const auto& pair : tables_) {
-        const auto& tableName = pair.first;
-        const auto& table = pair.second;
-        for (const auto& index : table.indexes) {
-            out << "INDEX " << index.name << " " << tableName << " " << index.columnName << "\n";
+        for (const auto& pair : tables_) {
+            const auto& tableName = pair.first;
+            const auto& table = pair.second;
+            for (const auto& index : table.indexes) {
+                out << "INDEX " << index.name << " " << tableName << " " << index.columnName << "\n";
+            }
         }
-    }
 
-    if (!out.good()) {
-        outError = "Failed while writing catalog";
-        return false;
-    }
-    return true;
+        if (!out.good()) {
+            writerError = "Failed while writing catalog";
+            return false;
+        }
+        return true;
+    }, outError);
 }
 
 bool Database::loadTableRows(const std::string& tableName, TableData& table, std::string& outError) {
@@ -314,13 +462,14 @@ bool Database::loadTableRows(const std::string& tableName, TableData& table, std
     }
 
     while (true) {
+        const std::streampos rowStart = in.tellg();
         Row row;
         row.reserve(table.columns.size());
         for (const auto& column : table.columns) {
             if (column.type == ColumnType::Int64) {
                 int64_t value = 0;
                 if (!readInt64(in, value)) {
-                    if (in.eof() && row.empty()) {
+                    if (recoverPartialTrailingRow(in, path, rowStart, tableName, outError)) {
                         return true;
                     }
                     outError = "Corrupt table data file (int read failed): " + tableName;
@@ -330,7 +479,7 @@ bool Database::loadTableRows(const std::string& tableName, TableData& table, std
             } else {
                 uint32_t length = 0;
                 if (!readUInt32(in, length)) {
-                    if (in.eof() && row.empty()) {
+                    if (recoverPartialTrailingRow(in, path, rowStart, tableName, outError)) {
                         return true;
                     }
                     outError = "Corrupt table data file (length read failed): " + tableName;
@@ -339,6 +488,9 @@ bool Database::loadTableRows(const std::string& tableName, TableData& table, std
                 std::string value(length, '\0');
                 in.read(value.data(), static_cast<std::streamsize>(length));
                 if (!in.good()) {
+                    if (recoverPartialTrailingRow(in, path, rowStart, tableName, outError)) {
+                        return true;
+                    }
                     outError = "Corrupt table data file (string read failed): " + tableName;
                     return false;
                 }
@@ -388,38 +540,36 @@ bool Database::appendRowToDisk(const std::string& tableName, const TableData& ta
 }
 
 bool Database::rewriteTableRows(const std::string& tableName, const TableData& table, std::string& outError) {
-    std::ofstream out(tablePath(dataDir_, tableName), std::ios::binary | std::ios::trunc);
-    if (!out.is_open()) {
-        outError = "Failed to rewrite table data file: " + tableName;
-        return false;
-    }
-    for (const auto& row : table.rows) {
-        for (std::size_t i = 0; i < table.columns.size(); ++i) {
-            const auto& column = table.columns[i];
-            if (column.type == ColumnType::Int64) {
-                if (!writeInt64(out, std::get<int64_t>(row[i]))) {
-                    outError = "Failed to write INT value";
-                    return false;
-                }
-            } else {
-                const auto& text = std::get<std::string>(row[i]);
-                if (text.size() > static_cast<std::size_t>(UINT32_MAX)) {
-                    outError = "TEXT value too large";
-                    return false;
-                }
-                if (!writeUInt32(out, static_cast<uint32_t>(text.size()))) {
-                    outError = "Failed to write TEXT length";
-                    return false;
-                }
-                out.write(text.data(), static_cast<std::streamsize>(text.size()));
-                if (!out.good()) {
-                    outError = "Failed to write TEXT value";
-                    return false;
+    return writeFileAtomically(tablePath(dataDir_, tableName), std::ios::binary | std::ios::out,
+                               [&](std::ofstream& out, std::string& writerError) {
+        for (const auto& row : table.rows) {
+            for (std::size_t i = 0; i < table.columns.size(); ++i) {
+                const auto& column = table.columns[i];
+                if (column.type == ColumnType::Int64) {
+                    if (!writeInt64(out, std::get<int64_t>(row[i]))) {
+                        writerError = "Failed to write INT value";
+                        return false;
+                    }
+                } else {
+                    const auto& text = std::get<std::string>(row[i]);
+                    if (text.size() > static_cast<std::size_t>(UINT32_MAX)) {
+                        writerError = "TEXT value too large";
+                        return false;
+                    }
+                    if (!writeUInt32(out, static_cast<uint32_t>(text.size()))) {
+                        writerError = "Failed to write TEXT length";
+                        return false;
+                    }
+                    out.write(text.data(), static_cast<std::streamsize>(text.size()));
+                    if (!out.good()) {
+                        writerError = "Failed to write TEXT value";
+                        return false;
+                    }
                 }
             }
         }
-    }
-    return true;
+        return true;
+    }, outError);
 }
 
 void Database::rebuildIndexes(TableData& table) {
@@ -431,6 +581,26 @@ void Database::rebuildIndexes(TableData& table) {
             index.tree.insert(std::get<int64_t>(table.rows[rowId][index.columnIndex]), rowId);
         }
     }
+}
+
+bool Database::validateUniqueConstraints(const TableData& table, const Row& row, std::optional<std::size_t> ignoredRowId, std::string& outMessage) const {
+    for (std::size_t columnIndex = 0; columnIndex < table.columns.size(); ++columnIndex) {
+        const auto& column = table.columns[columnIndex];
+        if (!column.unique) {
+            continue;
+        }
+
+        for (std::size_t rowId = 0; rowId < table.rows.size(); ++rowId) {
+            if (ignoredRowId.has_value() && rowId == ignoredRowId.value()) {
+                continue;
+            }
+            if (equalsValue(table.rows[rowId][columnIndex], row[columnIndex])) {
+                outMessage = "UNIQUE constraint failed: " + column.name;
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool Database::execute(const Statement& statement, std::string& outMessage, std::optional<SelectResult>& outSelectResult) {
@@ -448,8 +618,14 @@ bool Database::execute(const Statement& statement, std::string& outMessage, std:
     if (std::holds_alternative<DropTableStatement>(statement)) {
         return executeDropTable(std::get<DropTableStatement>(statement), outMessage);
     }
+    if (std::holds_alternative<DropIndexStatement>(statement)) {
+        return executeDropIndex(std::get<DropIndexStatement>(statement), outMessage);
+    }
     if (std::holds_alternative<DescribeTableStatement>(statement)) {
         return executeDescribeTable(std::get<DescribeTableStatement>(statement), outSelectResult, outMessage);
+    }
+    if (std::holds_alternative<AlterTableAddColumnStatement>(statement)) {
+        return executeAlterTableAddColumn(std::get<AlterTableAddColumnStatement>(statement), outMessage);
     }
     if (std::holds_alternative<UpdateStatement>(statement)) {
         return executeUpdate(std::get<UpdateStatement>(statement), outMessage);
@@ -533,6 +709,10 @@ bool Database::executeInsert(const InsertStatement& statement, std::string& outM
         }
         for (std::size_t i = 0; i < table.columns.size(); ++i) {
             if (!assigned[i]) {
+                if (table.columns[i].notNull) {
+                    outMessage = "NOT NULL constraint failed: " + table.columns[i].name;
+                    return false;
+                }
                 if (table.columns[i].type == ColumnType::Int64) {
                     row[i] = static_cast<int64_t>(0);
                 } else {
@@ -540,6 +720,10 @@ bool Database::executeInsert(const InsertStatement& statement, std::string& outM
                 }
             }
         }
+    }
+
+    if (!validateUniqueConstraints(table, row, std::nullopt, outMessage)) {
+        return false;
     }
 
     std::string diskError;
@@ -637,6 +821,35 @@ bool Database::executeDropTable(const DropTableStatement& statement, std::string
     return true;
 }
 
+bool Database::executeDropIndex(const DropIndexStatement& statement, std::string& outMessage) {
+    for (auto& tablePair : tables_) {
+        auto& indexes = tablePair.second.indexes;
+        auto indexIt = std::find_if(indexes.begin(), indexes.end(), [&](const IndexInfo& index) {
+            return equalsIgnoreCase(index.name, statement.indexName);
+        });
+        if (indexIt == indexes.end()) {
+            continue;
+        }
+
+        IndexInfo droppedIndex = std::move(*indexIt);
+        std::size_t indexPosition = static_cast<std::size_t>(indexIt - indexes.begin());
+        indexes.erase(indexIt);
+
+        std::string persistError;
+        if (!persistCatalog(persistError)) {
+            indexes.insert(indexes.begin() + static_cast<std::ptrdiff_t>(indexPosition), std::move(droppedIndex));
+            outMessage = persistError;
+            return false;
+        }
+
+        outMessage = "Index dropped: " + statement.indexName;
+        return true;
+    }
+
+    outMessage = "Unknown index: " + statement.indexName;
+    return false;
+}
+
 bool Database::executeDescribeTable(const DescribeTableStatement& statement, std::optional<SelectResult>& outSelectResult, std::string& outMessage) {
     auto tableIt = tables_.find(statement.tableName);
     if (tableIt == tables_.end()) {
@@ -646,7 +859,7 @@ bool Database::executeDescribeTable(const DescribeTableStatement& statement, std
 
     const auto& table = tableIt->second;
     SelectResult result;
-    result.columnNames = {"column", "type", "index"};
+    result.columnNames = {"column", "type", "not_null", "unique", "index"};
     for (std::size_t columnIndex = 0; columnIndex < table.columns.size(); ++columnIndex) {
         const auto& column = table.columns[columnIndex];
         std::string indexName;
@@ -660,12 +873,69 @@ bool Database::executeDescribeTable(const DescribeTableStatement& statement, std
         Row row;
         row.push_back(column.name);
         row.push_back(columnTypeToString(column.type));
+        row.push_back(column.notNull ? "YES" : "NO");
+        row.push_back(column.unique ? "YES" : "NO");
         row.push_back(indexName);
         result.rows.push_back(std::move(row));
     }
 
     outMessage = std::to_string(result.rows.size()) + " column(s)";
     outSelectResult = std::move(result);
+    return true;
+}
+
+bool Database::executeAlterTableAddColumn(const AlterTableAddColumnStatement& statement, std::string& outMessage) {
+    auto tableIt = tables_.find(statement.tableName);
+    if (tableIt == tables_.end()) {
+        outMessage = "Unknown table: " + statement.tableName;
+        return false;
+    }
+
+    auto& table = tableIt->second;
+    auto existingColumnIt = std::find_if(table.columns.begin(), table.columns.end(), [&](const Column& column) {
+        return equalsIgnoreCase(column.name, statement.column.name);
+    });
+    if (existingColumnIt != table.columns.end()) {
+        outMessage = "Column already exists: " + existingColumnIt->name;
+        return false;
+    }
+
+    TableData originalTable = table;
+    TableData updatedTable = table;
+    updatedTable.columns.push_back(statement.column);
+    Value defaultValue;
+    if (statement.column.type == ColumnType::Int64) {
+        defaultValue = static_cast<int64_t>(0);
+    } else {
+        defaultValue = std::string();
+    }
+    for (auto& row : updatedTable.rows) {
+        row.push_back(defaultValue);
+    }
+
+    for (std::size_t rowId = 0; rowId < updatedTable.rows.size(); ++rowId) {
+        if (!validateUniqueConstraints(updatedTable, updatedTable.rows[rowId], rowId, outMessage)) {
+            return false;
+        }
+    }
+
+    std::string diskError;
+    if (!rewriteTableRows(statement.tableName, updatedTable, diskError)) {
+        outMessage = diskError;
+        return false;
+    }
+
+    table = std::move(updatedTable);
+    std::string persistError;
+    if (!persistCatalog(persistError)) {
+        table = std::move(originalTable);
+        std::string rollbackError;
+        rewriteTableRows(statement.tableName, table, rollbackError);
+        outMessage = persistError;
+        return false;
+    }
+
+    outMessage = "Column added: " + statement.column.name;
     return true;
 }
 
@@ -939,10 +1209,28 @@ bool Database::executeSelect(const SelectStatement& statement, std::optional<Sel
             return false;
         };
 
+        const IndexInfo* rightJoinIndexInfo = nullptr;
+        auto rightIndexIt = std::find_if(rightTable.indexes.begin(), rightTable.indexes.end(), [&](const IndexInfo& index) {
+            return index.columnIndex == rightJoinIndex;
+        });
+        if (rightIndexIt != rightTable.indexes.end()) {
+            rightJoinIndexInfo = &(*rightIndexIt);
+        }
+
         std::vector<std::pair<std::size_t, std::size_t>> matchedPairs;
         for (std::size_t leftRowId = 0; leftRowId < leftTable.rows.size(); ++leftRowId) {
             const auto& leftRow = leftTable.rows[leftRowId];
-            for (std::size_t rightRowId = 0; rightRowId < rightTable.rows.size(); ++rightRowId) {
+            std::vector<std::size_t> rightRowCandidates;
+            if (rightJoinIndexInfo != nullptr && std::holds_alternative<int64_t>(leftRow[leftJoinIndex])) {
+                rightRowCandidates = rightJoinIndexInfo->tree.searchEqual(std::get<int64_t>(leftRow[leftJoinIndex]));
+            } else {
+                rightRowCandidates.reserve(rightTable.rows.size());
+                for (std::size_t rightRowId = 0; rightRowId < rightTable.rows.size(); ++rightRowId) {
+                    rightRowCandidates.push_back(rightRowId);
+                }
+            }
+
+            for (std::size_t rightRowId : rightRowCandidates) {
                 const auto& rightRow = rightTable.rows[rightRowId];
                 if (!equalsValue(leftRow[leftJoinIndex], rightRow[rightJoinIndex])) {
                     continue;
@@ -1443,23 +1731,32 @@ bool Database::executeUpdate(const UpdateStatement& statement, std::string& outM
         return false;
     };
 
+    std::vector<Row> updatedRows = table.rows;
     std::size_t updated = 0;
-    for (auto& row : table.rows) {
-        bool matches = !whereExpression.has_value() || evaluateWhereExpression(whereExpression.value(), row);
+    for (std::size_t rowId = 0; rowId < table.rows.size(); ++rowId) {
+        bool matches = !whereExpression.has_value() || evaluateWhereExpression(whereExpression.value(), table.rows[rowId]);
         if (!matches) {
             continue;
         }
         for (const auto& setBinding : setBindings) {
-            row[setBinding.index] = setBinding.value;
+            updatedRows[rowId][setBinding.index] = setBinding.value;
         }
         ++updated;
     }
 
+    TableData updatedTable = table;
+    updatedTable.rows = std::move(updatedRows);
+    for (std::size_t rowId = 0; rowId < updatedTable.rows.size(); ++rowId) {
+        if (!validateUniqueConstraints(updatedTable, updatedTable.rows[rowId], rowId, outMessage)) {
+            return false;
+        }
+    }
     std::string diskError;
-    if (!rewriteTableRows(statement.tableName, table, diskError)) {
+    if (!rewriteTableRows(statement.tableName, updatedTable, diskError)) {
         outMessage = diskError;
         return false;
     }
+    table.rows = std::move(updatedTable.rows);
     rebuildIndexes(table);
     outMessage = std::to_string(updated) + " row(s) updated";
     return true;
@@ -1563,13 +1860,15 @@ bool Database::executeDelete(const DeleteStatement& statement, std::string& outM
             keptRows.push_back(row);
         }
     }
-    table.rows = std::move(keptRows);
+    TableData updatedTable = table;
+    updatedTable.rows = std::move(keptRows);
 
     std::string diskError;
-    if (!rewriteTableRows(statement.tableName, table, diskError)) {
+    if (!rewriteTableRows(statement.tableName, updatedTable, diskError)) {
         outMessage = diskError;
         return false;
     }
+    table.rows = std::move(updatedTable.rows);
     rebuildIndexes(table);
     outMessage = std::to_string(deleted) + " row(s) deleted";
     return true;

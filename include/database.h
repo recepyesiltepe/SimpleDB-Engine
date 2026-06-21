@@ -47,12 +47,15 @@ private:
     bool appendRowToDisk(const std::string& tableName, const TableData& table, const Row& row, std::string& outError);
     bool rewriteTableRows(const std::string& tableName, const TableData& table, std::string& outError);
     void rebuildIndexes(TableData& table);
+    bool validateUniqueConstraints(const TableData& table, const Row& row, std::optional<std::size_t> ignoredRowId, std::string& outMessage) const;
 
     bool executeCreateTable(const CreateTableStatement& statement, std::string& outMessage);
     bool executeInsert(const InsertStatement& statement, std::string& outMessage);
     bool executeCreateIndex(const CreateIndexStatement& statement, std::string& outMessage);
     bool executeDropTable(const DropTableStatement& statement, std::string& outMessage);
+    bool executeDropIndex(const DropIndexStatement& statement, std::string& outMessage);
     bool executeDescribeTable(const DescribeTableStatement& statement, std::optional<SelectResult>& outSelectResult, std::string& outMessage);
+    bool executeAlterTableAddColumn(const AlterTableAddColumnStatement& statement, std::string& outMessage);
     bool executeSelect(const SelectStatement& statement, std::optional<SelectResult>& outSelectResult, std::string& outMessage);
     bool executeUpdate(const UpdateStatement& statement, std::string& outMessage);
     bool executeDelete(const DeleteStatement& statement, std::string& outMessage);

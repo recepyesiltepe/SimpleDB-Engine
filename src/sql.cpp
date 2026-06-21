@@ -118,6 +118,26 @@ public:
                         outError = "Unknown column type: " + typeToken;
                         return false;
                     }
+                    while (matchKeyword("NOT") || matchKeyword("UNIQUE")) {
+                        if (matchKeyword("NOT")) {
+                            if (column.notNull) {
+                                outError = "Duplicate NOT NULL constraint for column: " + column.name;
+                                return false;
+                            }
+                            consume();
+                            if (!expectKeyword("NULL", outError)) {
+                                return false;
+                            }
+                            column.notNull = true;
+                            continue;
+                        }
+                        if (column.unique) {
+                            outError = "Duplicate UNIQUE constraint for column: " + column.name;
+                            return false;
+                        }
+                        consume();
+                        column.unique = true;
+                    }
                     statement.columns.push_back(column);
 
                     if (matchSymbol(")")) {
@@ -174,11 +194,43 @@ public:
 
         if (matchKeyword("DROP")) {
             consume();
-            if (!expectKeyword("TABLE", outError)) {
-                return false;
+            if (matchKeyword("TABLE")) {
+                consume();
+                DropTableStatement statement;
+                if (!parseIdentifier(statement.tableName, outError)) {
+                    return false;
+                }
+                consumeSemicolonIfPresent();
+                if (current_.kind != TokenKind::End) {
+                    outError = "Unexpected trailing tokens";
+                    return false;
+                }
+                outStatement = statement;
+                return true;
             }
 
-            DropTableStatement statement;
+            if (matchKeyword("INDEX")) {
+                consume();
+                DropIndexStatement statement;
+                if (!parseIdentifier(statement.indexName, outError)) {
+                    return false;
+                }
+                consumeSemicolonIfPresent();
+                if (current_.kind != TokenKind::End) {
+                    outError = "Unexpected trailing tokens";
+                    return false;
+                }
+                outStatement = statement;
+                return true;
+            }
+
+            outError = "Expected TABLE or INDEX after DROP";
+            return false;
+        }
+
+        if (matchKeyword("DESCRIBE") || matchKeyword("DESC")) {
+            consume();
+            DescribeTableStatement statement;
             if (!parseIdentifier(statement.tableName, outError)) {
                 return false;
             }
@@ -191,11 +243,53 @@ public:
             return true;
         }
 
-        if (matchKeyword("DESCRIBE") || matchKeyword("DESC")) {
+        if (matchKeyword("ALTER")) {
             consume();
-            DescribeTableStatement statement;
+            if (!expectKeyword("TABLE", outError)) {
+                return false;
+            }
+
+            AlterTableAddColumnStatement statement;
             if (!parseIdentifier(statement.tableName, outError)) {
                 return false;
+            }
+            if (!expectKeyword("ADD", outError)) {
+                return false;
+            }
+            if (!expectKeyword("COLUMN", outError)) {
+                return false;
+            }
+            if (!parseIdentifier(statement.column.name, outError)) {
+                return false;
+            }
+
+            std::string typeToken;
+            if (!parseIdentifier(typeToken, outError)) {
+                return false;
+            }
+            if (!tryParseColumnType(typeToken, statement.column.type)) {
+                outError = "Unknown column type: " + typeToken;
+                return false;
+            }
+            while (matchKeyword("NOT") || matchKeyword("UNIQUE")) {
+                if (matchKeyword("NOT")) {
+                    if (statement.column.notNull) {
+                        outError = "Duplicate NOT NULL constraint for column: " + statement.column.name;
+                        return false;
+                    }
+                    consume();
+                    if (!expectKeyword("NULL", outError)) {
+                        return false;
+                    }
+                    statement.column.notNull = true;
+                    continue;
+                }
+                if (statement.column.unique) {
+                    outError = "Duplicate UNIQUE constraint for column: " + statement.column.name;
+                    return false;
+                }
+                consume();
+                statement.column.unique = true;
             }
             consumeSemicolonIfPresent();
             if (current_.kind != TokenKind::End) {

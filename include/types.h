@@ -15,6 +15,8 @@ enum class ColumnType {
 struct Column {
     std::string name;
     ColumnType type;
+    bool notNull = false;
+    bool unique = false;
 };
 
 using Value = std::variant<int64_t, std::string>;
